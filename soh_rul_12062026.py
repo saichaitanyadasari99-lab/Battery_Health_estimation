@@ -2795,10 +2795,11 @@ def compute_soh_labels(
         # (charging efficiency losses + SOC sensor bias at high-SOC). When STRICT baseline
         # snaps q_base to nominal but sensor measures ~7% less for a fresh pack, the SOH
         # ceiling is ~93% instead of 100%. Correct by scaling implied_Q_Ah up by q_base/q_raw.
-        # Cap at 15% to guard against bad early-session data skewing q_ref_for_soh.
+        # Cap at 30% — covers real sensor underread up to ~23% (max observed in fleet: ~19%).
+        # 1.15 was too tight for vehicles whose sensors under-read by 18-19%.
         sensor_cal_factor = 1.0
         if np.isfinite(q_ref_for_soh) and (q_ref_for_soh > 0) and (q_base_for_soh > q_ref_for_soh):
-            sensor_cal_factor = min(q_base_for_soh / q_ref_for_soh, 1.15)
+            sensor_cal_factor = min(q_base_for_soh / q_ref_for_soh, 1.30)
         g['sensor_cal_factor'] = sensor_cal_factor
         corrected_q = g['implied_Q_Ah'] * sensor_cal_factor
 

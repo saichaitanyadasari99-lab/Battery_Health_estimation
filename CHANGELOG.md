@@ -5,6 +5,32 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v5.0 — Sensor Cal Factor Cap 1.15 → 1.30 (2026-06-12)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v5.0-sensor-cal-cap`
+
+### What changed
+- **`sensor_cal_factor` cap raised from 1.15 to 1.30** (~line 2801).
+  The correction factor `q_base / q_ref_for_soh` was hard-capped at 1.15 (15% max correction).
+  Vehicles 415931, 383543, 468807 have sensors that under-read by ~18–19%, so their true
+  correction factor is ~1.18–1.22 — hitting the old cap every time. Every `soh_label` for
+  these vehicles was systematically 3–7pp too low; XGBoost learned that floor.
+
+### Why 1.30 and not uncapped
+The cap protects against noisy early sessions (tiny SOC swings) producing a falsely low
+`q_ref_for_soh` (e.g., 200 Ah instead of 515 Ah), which would give a factor of 3.0 and
+clip every `soh_label` to 100%. The IQR filter in `_estimate_initial_capacity_ah` handles
+most cases; 1.30 is the final backstop. Maximum observed real-world underread in this fleet
+is ~19%, so 1.30 gives 11pp of safety margin.
+
+### Expected impact
+- 415931, 383543, 468807: `sensor_cal_factor` now ~1.18–1.22 instead of 1.15 → `soh_label`
+  increases by 3–7pp → XGBoost trains on corrected labels → `soh_display` moves toward BMS.
+- All other vehicles: unaffected (`if q_base_for_soh > q_ref_for_soh` guard; vehicles that
+  over-read or read accurately stay at `sensor_cal_factor = 1.0`).
+
+---
+
 ## v4.0 — Weighted Training + Chassis ID + Device Tracking (2026-06-12)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v4.0-weighted-chassis`
