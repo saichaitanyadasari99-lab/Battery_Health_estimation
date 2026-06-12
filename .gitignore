@@ -1,0 +1,23 @@
+# Vehicle data — private, do not commit
+data/
+
+# Pipeline cache
+*.pkl
+ev_pipeline_state.pkl
+
+# Generated outputs (images, result CSVs)
+soh_rul_results_by_vehicle/
+soh_rul_results_customer_cards/
+soh_rul_results_exports/
+*.png
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
