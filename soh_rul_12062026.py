@@ -124,7 +124,7 @@ REPL_WINDOW = 8                       # Sessions per side for replacement median
 REPL_PERSIST_M = 6                    # Lookahead window for persistence
 REPL_PERSIST_K = 3                    # Required confirmations in lookahead
 CONFIRM_WINDOW_DOWN = 30              # Consecutive sessions needed to confirm a new LOWER SOH
-CONFIRM_WINDOW_UP   = 5              # Consecutive sessions needed to confirm a new HIGHER SOH
+CONFIRM_WINDOW_UP   = 20             # Consecutive sessions needed to confirm a new HIGHER SOH
 CONFIRM_THRESHOLD   = 3.0             # pp — within this of confirmed SOH → accepted immediately
 
 # ------------------------------------------------------------------------------
@@ -665,45 +665,56 @@ def _apply_latest_device_per_file_identity(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df['device_id_raw'] = _clean_id_series(df[device_col])
 
-    latest_by_file = {}
+    # Build two maps per source file:
+    #   chassis_by_file  → filename stem (MC2V7SRT0TF131176) used as canonical vehicle_id
+    #   imei_by_file     → latest device ID (IMEI) stored separately for tracking
+    chassis_by_file = {}
+    imei_by_file    = {}
     for source_key, idx in group_keys.groupby(group_keys).groups.items():
+        stem   = Path(str(source_key)).stem   # e.g. MC2V7SRT0TF131176
         latest = _latest_device_id_for_group(df.loc[idx], device_col)
+        if stem:
+            chassis_by_file[source_key] = stem
         if pd.notna(latest) and str(latest).strip():
-            latest_by_file[source_key] = latest
+            imei_by_file[source_key] = latest
 
-    if not latest_by_file:
-        print("    [WARN] No usable latest device IDs found; keeping existing vehicle ID resolution.")
+    if not chassis_by_file:
+        print("    [WARN] No usable chassis IDs (file stems) found; keeping existing vehicle ID resolution.")
         return df
 
-    file_vehicle_id = group_keys.map(latest_by_file)
-    fallback = df['vehicle_id'] if 'vehicle_id' in df.columns else df['device_id_raw']
-    df['vehicle_id'] = file_vehicle_id.combine_first(fallback).fillna('unknown_vehicle').astype(str)
+    # vehicle_id = chassis number (filename stem); actual IMEI stored in imei_from_file
+    file_vehicle_id  = group_keys.map(chassis_by_file)
+    file_imei        = group_keys.map(imei_by_file)
+    fallback         = df['vehicle_id'] if 'vehicle_id' in df.columns else df['device_id_raw']
+    df['vehicle_id']      = file_vehicle_id.combine_first(fallback).fillna('unknown_vehicle').astype(str)
+    df['imei_from_file']  = file_imei   # keep IMEI for reference / device-change tracking
 
+    # Alias map: IMEI → chassis so incremental cache lookups still resolve correctly
     runtime_alias_map = {}
     alias_pairs = pd.DataFrame({
-        'source_key': group_keys,
-        'raw_id': df['device_id_raw'],
-        'vehicle_id': df['vehicle_id'],
+        'imei':    df['imei_from_file'],
+        'chassis': df['vehicle_id'],
     }).dropna().drop_duplicates()
     for _, row in alias_pairs.iterrows():
-        raw_id = _normalize_vehicle_id_text(row['raw_id'])
-        canonical_id = _normalize_vehicle_id_text(row['vehicle_id'])
-        if raw_id and canonical_id:
-            for key in _vehicle_id_lookup_keys(raw_id):
-                runtime_alias_map[key] = canonical_id
-            for key in _vehicle_id_lookup_keys(canonical_id):
-                runtime_alias_map[key] = canonical_id
+        imei_norm    = _normalize_vehicle_id_text(row['imei'])
+        chassis_norm = _normalize_vehicle_id_text(row['chassis'])
+        if imei_norm and chassis_norm:
+            for key in _vehicle_id_lookup_keys(imei_norm):
+                runtime_alias_map[key] = chassis_norm
+            for key in _vehicle_id_lookup_keys(chassis_norm):
+                runtime_alias_map[key] = chassis_norm
     df.attrs['vehicle_id_alias_map'] = runtime_alias_map
 
     print(
-        "    Vehicle ID mode: latest_device_per_file | "
-        f"{len(latest_by_file):,} file(s), {df['device_id_raw'].nunique(dropna=True):,} raw device ID(s), "
-        f"{df['vehicle_id'].nunique(dropna=True):,} vehicle ID(s)"
+        "    Vehicle ID mode: chassis_from_filename | "
+        f"{len(chassis_by_file):,} file(s), {df['device_id_raw'].nunique(dropna=True):,} IMEI(s), "
+        f"{df['vehicle_id'].nunique(dropna=True):,} chassis IDs"
     )
-    for source_key, latest in list(latest_by_file.items())[:10]:
-        print(f"      {Path(str(source_key)).name} -> vehicle_id={latest}")
-    if len(latest_by_file) > 10:
-        print(f"      ... and {len(latest_by_file) - 10} more")
+    for source_key, chassis in list(chassis_by_file.items())[:10]:
+        imei = imei_by_file.get(source_key, 'unknown')
+        print(f"      {Path(str(source_key)).name} -> chassis={chassis}  imei={imei}")
+    if len(chassis_by_file) > 10:
+        print(f"      ... and {len(chassis_by_file) - 10} more")
     return df
 
 
@@ -2903,6 +2914,26 @@ def train_xgboost_soh(labeled: pd.DataFrame) -> dict:
         X_tr_s   = scaler.fit_transform(X_tr)
         X_te_s   = scaler.transform(X_te)
 
+        # Session quality weights: large delta_soc → accurate implied_Q → high weight.
+        # Small delta_soc sessions (5-10% swing) amplify sensor noise into bad soh_label.
+        # Recency bonus: recent sessions slightly more representative of current state.
+        if 'delta_soc_pct' in g.columns:
+            dsoc   = _finite_series(g['delta_soc_pct']).fillna(MIN_DELTA_SOC).values
+            dsoc_w = np.clip(dsoc / 30.0, 0.1, 1.0)   # 30% swing = full weight; <3% = 0.1
+        else:
+            dsoc_w = np.ones(len(g))
+
+        hv     = _finite_series(g[sort_col]).values.astype(float)
+        hv_min, hv_max = np.nanmin(hv), np.nanmax(hv)
+        if np.isfinite(hv_max - hv_min) and (hv_max - hv_min) > 0:
+            recency_w = 0.5 + 0.5 * (hv - hv_min) / (hv_max - hv_min)
+        else:
+            recency_w = np.ones(len(g))
+
+        session_w    = (dsoc_w * recency_w).astype(float)
+        session_w   /= session_w.mean()   # normalise so total weight ≈ n_sessions
+        weights_tr   = session_w[:split]
+
         model = XGBRegressor(
             n_estimators     = 400,
             max_depth        = 3,
@@ -2915,7 +2946,8 @@ def train_xgboost_soh(labeled: pd.DataFrame) -> dict:
             random_state     = 42,
             verbosity        = 0,
         )
-        model.fit(X_tr_s, y_tr, eval_set=[(X_te_s, y_te)], verbose=False)
+        model.fit(X_tr_s, y_tr, sample_weight=weights_tr,
+                  eval_set=[(X_te_s, y_te)], verbose=False)
 
         # Raw prediction stored for debugging; soh_display is the customer-facing value
         raw_pred         = model.predict(scaler.transform(X.values))

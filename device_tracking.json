@@ -1,0 +1,100 @@
+{
+  "_readme": "Maps chassis number (CSV filename) to vehicle name and IMEI history. Update imei_history whenever a device (telematics unit) is replaced on a vehicle. The pipeline uses chassis number as the stable vehicle_id; this file is the audit trail for IMEI changes.",
+
+  "MC2R9SRT0TE130222": {
+    "vehicle_name": "UP15JT5763",
+    "fleet": "Leafy Bus",
+    "current_imei": "352914091292983",
+    "imei_history": [
+      {"imei": "352914091292983", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2R9SRT0TG132697": {
+    "vehicle_name": "UP15JT6921",
+    "fleet": "Leafy Bus",
+    "current_imei": "352914091383543",
+    "imei_history": [
+      {"imei": "352914091383543", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2R9SRT0TH133336": {
+    "vehicle_name": "UP15JT5766",
+    "fleet": "Leafy Bus",
+    "current_imei": "352914091373361",
+    "imei_history": [
+      {"imei": "352914091373361", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2R9SRT0TH133337": {
+    "vehicle_name": "UP15JT5767",
+    "fleet": "Leafy Bus",
+    "current_imei": "352914091415931",
+    "imei_history": [
+      {"imei": "352914091415931", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2V7SRT0TF131176": {
+    "vehicle_name": "MP09DE3136",
+    "fleet": "MP Staff",
+    "current_imei": "352914091532594",
+    "imei_history": [
+      {"imei": "352914091532594", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2V7SRT0TF131268": {
+    "vehicle_name": "MP09DJ3115",
+    "fleet": "MP Staff",
+    "current_imei": "352914000000000",
+    "imei_history": [
+      {"imei": "352914000000000", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2V7SRT0TG132660": {
+    "vehicle_name": "MP09DE3133",
+    "fleet": "MP Staff",
+    "current_imei": "352914091532446",
+    "imei_history": [
+      {"imei": "352914091532446", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2V7SRT0TG132661": {
+    "vehicle_name": "MP09DE9796",
+    "fleet": "MP Staff",
+    "current_imei": "352914091688628",
+    "imei_history": [
+      {"imei": "352914091688628", "from_date": null, "to_date": null, "note": ""}
+    ]
+  },
+  "MC2V2HRT0PH228159": {
+    "vehicle_name": "",
+    "fleet": "",
+    "current_imei": "",
+    "imei_history": [
+      {"imei": "", "from_date": null, "to_date": null, "note": "newly added — fill vehicle name and IMEI"}
+    ]
+  },
+  "MC2V2HRT0PH228160": {
+    "vehicle_name": "",
+    "fleet": "",
+    "current_imei": "",
+    "imei_history": [
+      {"imei": "", "from_date": null, "to_date": null, "note": "newly added — fill vehicle name and IMEI"}
+    ]
+  },
+  "MC2V2HRT0PH228163": {
+    "vehicle_name": "",
+    "fleet": "",
+    "current_imei": "",
+    "imei_history": [
+      {"imei": "", "from_date": null, "to_date": null, "note": "newly added — fill vehicle name and IMEI"}
+    ]
+  },
+  "MC2V2HRT0PH228171": {
+    "vehicle_name": "",
+    "fleet": "",
+    "current_imei": "",
+    "imei_history": [
+      {"imei": "", "from_date": null, "to_date": null, "note": "newly added — fill vehicle name and IMEI"}
+    ]
+  }
+}
