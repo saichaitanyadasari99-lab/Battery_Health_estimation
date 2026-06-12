@@ -5,6 +5,31 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v6.0 — Improved RUL: Recency-Weighted Slope + Slope-Sampling Uncertainty (2026-06-12)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v6.0-rul-weighted-slope`
+
+### What changed
+- **`extrapolate_rul()` fully rewritten**: replaced knee detection + multiple-window selection
+  with a single recency-weighted Weighted Least Squares (WLS) fit on the most recent 50% of
+  sessions (min 8). Exponential weights give the newest session weight=1.0, oldest ~0.14.
+  One stable slope, no window flip-flopping.
+- **Uncertainty via slope sampling** (replaces Gaussian noise on SOH values): WLS gives a
+  standard error for the slope. Sample 500 slopes from `Normal(slope, slope_se)` → P10/P50/P90
+  of RUL. Tighter P10/P90 for vehicles with a clear trend; wider for noisy/short data.
+- **Floor degradation rate** (0.3%/year): when no negative slope is detected, report a
+  conservative upper-bound RUL as `rul_days_p90` instead of ∞.
+- **Recent km/day** (last 60 days): `km_to_eol` now uses recent usage rate instead of all-time
+  average. Falls back to historical if <5 data points in the window.
+- **`km_per_day_recent`** added to fleet_summary.csv for transparency.
+
+### Why
+Old MC approach added noise to SOH readings (sensor noise model). WLS slope-sampling models
+uncertainty in the degradation *trend* — physically correct. Old knee detection on noisy SOH
+was unreliable; recency-weighted tail WLS is stable and reflects current behavior.
+
+---
+
 ## v5.0 — Sensor Cal Factor Cap 1.15 → 1.30 (2026-06-12)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v5.0-sensor-cal-cap`

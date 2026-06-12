@@ -117,9 +117,14 @@ PACK_FIXED_BASELINE_AH = {
     '208s2p': 300.0,
     '208s4p': 608.0,
 }
-RUL_MIN_NEG_SLOPE = -1e-6             # Min negative slope treated as degrading
-RUL_GLOBAL_DROP_TRIGGER_PCT = 2.0     # Allow global slope if total drop is meaningful
+RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
+RUL_TAIL_FRACTION           = 0.50    # Fraction of sessions used for WLS slope (recent half)
+RUL_TAIL_MIN_SESSIONS       = 8       # Minimum sessions in tail window
+RUL_RECENCY_WEIGHT_K        = 2.0     # Exponential decay: newest=1.0, oldest=exp(-K) ~0.14
+RUL_SLOPE_SAMPLES           = 500     # Slope samples for P10/P50/P90
+RUL_FLOOR_PCT_PER_YEAR      = 0.3     # Minimum assumed SOH loss %/year (conservative floor)
+RECENT_KM_WINDOW_DAYS       = 60      # Window for recent km/day estimate
 REPL_WINDOW = 8                       # Sessions per side for replacement medians
 REPL_PERSIST_M = 6                    # Lookahead window for persistence
 REPL_PERSIST_K = 3                    # Required confirmations in lookahead
@@ -3070,178 +3075,155 @@ def train_lstm_trajectory(xgb_results: dict, lookback: int = 10) -> dict:
 # STEP 6 - RUL: EXTRAPOLATE SOH TO 80% EOL
 # ------------------------------------------------------------------------------
 def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
-                    eol=SOH_EOL, n_mc=200) -> dict:
+                    eol=SOH_EOL) -> dict:
     hrlfc_seq = np.array(hrlfc_seq, dtype=float)
     soh_seq   = np.array(soh_seq,   dtype=float)
 
     finite = np.isfinite(hrlfc_seq) & np.isfinite(soh_seq)
     hrlfc_seq = hrlfc_seq[finite]
-    soh_seq = soh_seq[finite]
+    soh_seq   = soh_seq[finite]
+
+    _nan_result = {
+        'phase2_slope'  : 0.0,
+        'soh_now'       : soh_seq[-1] if len(soh_seq) else np.nan,
+        'hrlfc_now'     : hrlfc_seq[-1] if len(hrlfc_seq) else np.nan,
+        'rul_hrlfc_p10' : np.nan, 'rul_hrlfc_p50' : np.nan, 'rul_hrlfc_p90' : np.nan,
+        'rul_days_p10'  : np.nan, 'rul_days_p50'  : np.nan, 'rul_days_p90'  : np.nan,
+        'slope_basis'   : 'insufficient_data',
+    }
     if len(hrlfc_seq) < 4:
-        return {
-            'knee_hrlfc'    : np.nan,
-            'phase2_slope'  : 0.0,
-            'soh_now'       : soh_seq[-1] if len(soh_seq) else np.nan,
-            'hrlfc_now'     : hrlfc_seq[-1] if len(hrlfc_seq) else np.nan,
-            'rul_hrlfc_p10' : np.nan, 'rul_hrlfc_p50' : np.nan, 'rul_hrlfc_p90' : np.nan,
-            'rul_days_p10'  : np.nan, 'rul_days_p50'  : np.nan, 'rul_days_p90'  : np.nan,
-        }
+        return _nan_result
 
     order = np.argsort(hrlfc_seq)
     hrlfc_seq = hrlfc_seq[order]
-    soh_seq = soh_seq[order]
+    soh_seq   = soh_seq[order]
 
     dedup = (
         pd.DataFrame({'x': hrlfc_seq, 'y': soh_seq})
         .groupby('x', as_index=False)['y'].median()
     )
     hrlfc_seq = dedup['x'].values
-    soh_seq = dedup['y'].values
+    soh_seq   = dedup['y'].values
 
     if len(hrlfc_seq) < 3:
-        return {
-            'knee_hrlfc'    : hrlfc_seq[-1],
-            'phase2_slope'  : 0.0,
-            'soh_now'       : soh_seq[-1],
-            'hrlfc_now'     : hrlfc_seq[-1],
-            'rul_hrlfc_p10' : np.nan, 'rul_hrlfc_p50' : np.nan, 'rul_hrlfc_p90' : np.nan,
-            'rul_days_p10'  : np.nan, 'rul_days_p50'  : np.nan, 'rul_days_p90'  : np.nan,
-            'slope_basis'   : 'insufficient_points',
-        }
+        _nan_result['soh_now']   = soh_seq[-1]
+        _nan_result['hrlfc_now'] = hrlfc_seq[-1]
+        return _nan_result
 
     if (not np.isfinite(hrlfc_to_days)) or (hrlfc_to_days <= 0):
         hrlfc_to_days = 0.07
 
-    # Knee detection
-    if len(soh_seq) >= 5 and np.ptp(hrlfc_seq) > 0:
-        smooth  = pd.Series(soh_seq).rolling(5, center=True, min_periods=2).mean().values
-        try:
-            dy2 = np.gradient(np.gradient(smooth, hrlfc_seq), hrlfc_seq)
-            finite_dy2 = np.where(np.isfinite(dy2), dy2, np.nan)
-            knee_idx = int(np.nanargmin(finite_dy2)) if np.isfinite(finite_dy2).any() else (len(soh_seq) // 2)
-        except Exception:
-            knee_idx = len(soh_seq) // 2
+    soh_now   = float(soh_seq[-1])
+    hrlfc_now = float(hrlfc_seq[-1])
+
+    # --- Recency-weighted tail window ---
+    n      = len(hrlfc_seq)
+    tail_n = min(n, max(RUL_TAIL_MIN_SESSIONS, int(np.ceil(RUL_TAIL_FRACTION * n))))
+    x_tail = hrlfc_seq[-tail_n:]
+    y_tail = soh_seq[-tail_n:]
+
+    if tail_n > 1:
+        ranks  = np.arange(tail_n, dtype=float)
+        w_tail = np.exp(RUL_RECENCY_WEIGHT_K * (ranks / (tail_n - 1) - 1.0))
     else:
-        knee_idx = len(soh_seq) // 2
+        w_tail = np.ones(1)
 
-    knee_hrlfc = hrlfc_seq[knee_idx]
-    total_drop = float(soh_seq[0] - soh_seq[-1]) if len(soh_seq) >= 2 else 0.0
+    # Weighted least squares: solve (W^0.5 X) b = W^0.5 y
+    X_mat  = np.column_stack([x_tail, np.ones(tail_n)])
+    W_sqrt = np.sqrt(w_tail)
+    Xw     = X_mat  * W_sqrt[:, None]
+    yw     = y_tail * W_sqrt
+    coeffs, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
+    slope     = float(coeffs[0])
+    intercept = float(coeffs[1])
 
-    def _fit_line(x, y, label):
-        x = np.asarray(x, dtype=float)
-        y = np.asarray(y, dtype=float)
-        m = np.isfinite(x) & np.isfinite(y)
-        x = x[m]
-        y = y[m]
-        if len(x) < 3 or np.all(x == x[0]):
-            return None
-        s, b, *_ = stats.linregress(x, y)
-        if (not np.isfinite(s)) or (not np.isfinite(b)):
-            return None
-        return {'label': label, 'x': x, 'y': y, 'slope': float(s), 'intercept': float(b)}
+    # Standard error of slope from WLS residuals
+    y_hat        = slope * x_tail + intercept
+    residuals    = y_tail - y_hat
+    w_sum        = float(np.sum(w_tail))
+    weighted_sse = float(np.sum(w_tail * residuals ** 2))
+    x_w_mean     = float(np.sum(w_tail * x_tail) / w_sum)
+    weighted_ssx = float(np.sum(w_tail * (x_tail - x_w_mean) ** 2))
+    dof          = max(tail_n - 2, 1)
+    slope_se     = float(np.sqrt(weighted_sse / dof / max(weighted_ssx, 1e-12)))
+    slope_se     = max(slope_se, abs(slope) * 0.05)   # at least 5% of slope magnitude
 
-    n = len(hrlfc_seq)
-    windows = []
-    # knee-to-end
-    mask_knee = hrlfc_seq >= knee_hrlfc
-    if mask_knee.sum() >= 3:
-        windows.append((hrlfc_seq[mask_knee], soh_seq[mask_knee], 'knee_tail'))
-    # fixed tail fractions
-    for frac in [0.30, 0.40, 0.50]:
-        k = max(8, int(np.ceil(frac * n)))
-        k = min(k, n)
-        windows.append((hrlfc_seq[-k:], soh_seq[-k:], f'tail_{int(frac*100)}'))
-    # global
-    windows.append((hrlfc_seq, soh_seq, 'global'))
+    # --- Floor degradation rate (conservative estimate for flat/new vehicles) ---
+    hrlfc_per_year = (365.0 / hrlfc_to_days) if hrlfc_to_days > 0 else np.nan
+    floor_slope = (-(RUL_FLOOR_PCT_PER_YEAR / hrlfc_per_year)
+                   if np.isfinite(hrlfc_per_year) else np.nan)
 
-    fits = []
-    seen = set()
-    for xw, yw, label in windows:
-        key = (len(xw), float(xw[0]) if len(xw) else np.nan, float(xw[-1]) if len(xw) else np.nan, label)
-        if key in seen:
-            continue
-        seen.add(key)
-        f = _fit_line(xw, yw, label)
-        if f is not None:
-            fits.append(f)
+    # --- RUL via slope sampling ---
+    if slope < RUL_MIN_NEG_SLOPE:
+        slope_basis   = 'wls_tail_recency'
+        slope_samples = np.random.normal(slope, slope_se, RUL_SLOPE_SAMPLES)
+        rul_samples   = []
+        for s in slope_samples:
+            if s < RUL_MIN_NEG_SLOPE:
+                rul_h = max(0.0, (eol - intercept) / s - hrlfc_now)
+                if np.isfinite(rul_h):
+                    rul_samples.append(rul_h)
 
-    if not fits:
+        if rul_samples:
+            rul_arr = np.array(rul_samples)
+            return {
+                'phase2_slope'  : slope,
+                'slope_se'      : slope_se,
+                'soh_now'       : soh_now,
+                'hrlfc_now'     : hrlfc_now,
+                'rul_hrlfc_p10' : float(np.percentile(rul_arr, 10)),
+                'rul_hrlfc_p50' : float(np.percentile(rul_arr, 50)),
+                'rul_hrlfc_p90' : float(np.percentile(rul_arr, 90)),
+                'rul_days_p10'  : float(np.percentile(rul_arr, 10)) * hrlfc_to_days,
+                'rul_days_p50'  : float(np.percentile(rul_arr, 50)) * hrlfc_to_days,
+                'rul_days_p90'  : float(np.percentile(rul_arr, 90)) * hrlfc_to_days,
+                'slope_basis'   : slope_basis,
+            }
+        # Slope sampling produced no valid RUL; fall through to deterministic
+        rul_det = max(0.0, (eol - intercept) / slope - hrlfc_now)
         return {
-            'knee_hrlfc'    : knee_hrlfc,
-            'phase2_slope'  : 0.0,
-            'soh_now'       : soh_seq[-1],
-            'hrlfc_now'     : hrlfc_seq[-1],
-            'rul_hrlfc_p10' : np.nan, 'rul_hrlfc_p50' : np.nan, 'rul_hrlfc_p90' : np.nan,
-            'rul_days_p10'  : np.nan, 'rul_days_p50'  : np.nan, 'rul_days_p90'  : np.nan,
-            'slope_basis'   : 'no_valid_fit',
-        }
-
-    tail_fits = [f for f in fits if f['label'] != 'global']
-    tail_neg = [f for f in tail_fits if f['slope'] < RUL_MIN_NEG_SLOPE]
-    global_fit = next((f for f in fits if f['label'] == 'global'), None)
-
-    chosen = None
-    if tail_neg:
-        # Robust center of negative tail slopes.
-        slopes = np.array([f['slope'] for f in tail_neg], dtype=float)
-        target = float(np.median(slopes))
-        chosen = min(tail_neg, key=lambda f: abs(f['slope'] - target))
-    elif (global_fit is not None) and (global_fit['slope'] < RUL_MIN_NEG_SLOPE) and (total_drop >= RUL_GLOBAL_DROP_TRIGGER_PCT):
-        # Tail looks flat but overall decline is meaningful.
-        chosen = global_fit
-    else:
-        # Pick least steep fit only for metadata; RUL likely infinite.
-        chosen = min(fits, key=lambda f: abs(f['slope']))
-
-    base_slope = float(chosen['slope'])
-    base_intercept = float(chosen['intercept'])
-    x2, y2 = chosen['x'], chosen['y']
-    slope_basis = chosen['label']
-
-    noise_std = float(np.nanstd(np.diff(y2))) if len(y2) > 2 else 1.0
-    noise_std = max(noise_std, 0.3)
-    rul_samples = []
-    for _ in range(n_mc):
-        y_noisy = y2 + np.random.normal(0, noise_std, size=len(y2))
-        s, b, *_ = stats.linregress(x2, y_noisy)
-        if (not np.isfinite(s)) or (not np.isfinite(b)) or s >= RUL_MIN_NEG_SLOPE:
-            continue
-        rul_hrlfc = max(0, (eol - b) / s - hrlfc_seq[-1])
-        if np.isfinite(rul_hrlfc):
-            rul_samples.append(rul_hrlfc)
-
-    if not rul_samples:
-        if base_slope < RUL_MIN_NEG_SLOPE:
-            rul_det = max(0, (eol - base_intercept) / base_slope - hrlfc_seq[-1])
-        else:
-            rul_det = 0.0 if soh_seq[-1] <= eol else np.inf
-
-        return {
-            'knee_hrlfc'    : knee_hrlfc,
-            'phase2_slope'  : base_slope,
-            'soh_now'       : soh_seq[-1],
-            'hrlfc_now'     : hrlfc_seq[-1],
+            'phase2_slope'  : slope,
+            'slope_se'      : slope_se,
+            'soh_now'       : soh_now,
+            'hrlfc_now'     : hrlfc_now,
             'rul_hrlfc_p10' : rul_det, 'rul_hrlfc_p50' : rul_det, 'rul_hrlfc_p90' : rul_det,
             'rul_days_p10'  : rul_det * hrlfc_to_days,
             'rul_days_p50'  : rul_det * hrlfc_to_days,
             'rul_days_p90'  : rul_det * hrlfc_to_days,
-            'slope_basis'   : slope_basis,
+            'slope_basis'   : slope_basis + '_det_fallback',
         }
 
-    rul_arr = np.array(rul_samples)
-    return {
-        'knee_hrlfc'    : knee_hrlfc,
-        'phase2_slope'  : base_slope,
-        'soh_now'       : soh_seq[-1],
-        'hrlfc_now'     : hrlfc_seq[-1],
-        'rul_hrlfc_p10' : np.percentile(rul_arr, 10),
-        'rul_hrlfc_p50' : np.percentile(rul_arr, 50),
-        'rul_hrlfc_p90' : np.percentile(rul_arr, 90),
-        'rul_days_p10'  : np.percentile(rul_arr, 10) * hrlfc_to_days,
-        'rul_days_p50'  : np.percentile(rul_arr, 50) * hrlfc_to_days,
-        'rul_days_p90'  : np.percentile(rul_arr, 90) * hrlfc_to_days,
-        'slope_basis'   : slope_basis,
-    }
+    # No degradation detected in tail — use floor rate for a conservative upper-bound estimate
+    if np.isfinite(floor_slope) and soh_now > eol:
+        rul_floor_h   = max(0.0, (eol - soh_now) / floor_slope)
+        rul_floor_d   = rul_floor_h * hrlfc_to_days
+        return {
+            'phase2_slope'  : slope,
+            'slope_se'      : slope_se,
+            'soh_now'       : soh_now,
+            'hrlfc_now'     : hrlfc_now,
+            'rul_hrlfc_p10' : np.nan,          # degradation not confirmed
+            'rul_hrlfc_p50' : np.nan,
+            'rul_hrlfc_p90' : rul_floor_h,     # conservative floor-rate upper bound
+            'rul_days_p10'  : np.nan,
+            'rul_days_p50'  : np.nan,
+            'rul_days_p90'  : rul_floor_d,
+            'slope_basis'   : 'floor_rate_no_degradation',
+        }
+
+    # SOH already at or below EOL
+    if soh_now <= eol:
+        return {
+            'phase2_slope'  : slope,
+            'slope_se'      : slope_se,
+            'soh_now'       : soh_now,
+            'hrlfc_now'     : hrlfc_now,
+            'rul_hrlfc_p10' : 0.0, 'rul_hrlfc_p50' : 0.0, 'rul_hrlfc_p90' : 0.0,
+            'rul_days_p10'  : 0.0, 'rul_days_p50'  : 0.0, 'rul_days_p90'  : 0.0,
+            'slope_basis'   : 'already_at_eol',
+        }
+
+    return _nan_result
 
 def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None) -> dict:
     print("[6/6] Computing RUL...")
@@ -3281,6 +3263,18 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         dist_vals = _finite_series(raw_v['totalDistance']) if 'totalDistance' in raw_v.columns else pd.Series(dtype=float)
         km_run_till_date = (dist_vals.max() - dist_vals.min()) if dist_vals.notna().sum() >= 2 else np.nan
         km_per_day_hist = (km_run_till_date / days_span) if (np.isfinite(km_run_till_date) and np.isfinite(days_span) and days_span > 0) else np.nan
+
+        # Recent km/day: use last RECENT_KM_WINDOW_DAYS days; fallback to historical average
+        km_per_day = km_per_day_hist
+        if np.isfinite(last_utc) and '_utc_num' in raw_v.columns and 'totalDistance' in raw_v.columns:
+            cutoff_utc   = last_utc - RECENT_KM_WINDOW_DAYS * 86400
+            recent_rows  = raw_v[raw_v['_utc_num'] >= cutoff_utc]
+            recent_dist  = _finite_series(recent_rows['totalDistance'])
+            if recent_dist.notna().sum() >= 5:
+                recent_km    = float(recent_dist.max() - recent_dist.min())
+                recent_days  = float((recent_dist.index.max() - recent_dist.index.min()) if False
+                               else RECENT_KM_WINDOW_DAYS)
+                km_per_day   = recent_km / RECENT_KM_WINDOW_DAYS if recent_km >= 0 else km_per_day_hist
         axis_span = (np.nanmax(axis_vals) - np.nanmin(axis_vals)) if np.isfinite(axis_vals).sum() >= 2 else np.nan
 
         if axis_name == 'elapsed_days':
@@ -3382,9 +3376,9 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         e_to_eol_p10 = (r10 * kwh_per_axis) if np.isfinite(r10) and np.isfinite(kwh_per_axis) else (np.inf if np.isinf(r10) and np.isfinite(kwh_per_axis) else np.nan)
         e_to_eol_p50 = (r50 * kwh_per_axis) if np.isfinite(r50) and np.isfinite(kwh_per_axis) else (np.inf if np.isinf(r50) and np.isfinite(kwh_per_axis) else np.nan)
         e_to_eol_p90 = (r90 * kwh_per_axis) if np.isfinite(r90) and np.isfinite(kwh_per_axis) else (np.inf if np.isinf(r90) and np.isfinite(kwh_per_axis) else np.nan)
-        km_to_eol_p10 = (d10 * km_per_day_hist) if np.isfinite(d10) and np.isfinite(km_per_day_hist) else (np.inf if np.isinf(d10) and np.isfinite(km_per_day_hist) else np.nan)
-        km_to_eol_p50 = (d50 * km_per_day_hist) if np.isfinite(d50) and np.isfinite(km_per_day_hist) else (np.inf if np.isinf(d50) and np.isfinite(km_per_day_hist) else np.nan)
-        km_to_eol_p90 = (d90 * km_per_day_hist) if np.isfinite(d90) and np.isfinite(km_per_day_hist) else (np.inf if np.isinf(d90) and np.isfinite(km_per_day_hist) else np.nan)
+        km_to_eol_p10 = (d10 * km_per_day) if np.isfinite(d10) and np.isfinite(km_per_day) else (np.inf if np.isinf(d10) and np.isfinite(km_per_day) else np.nan)
+        km_to_eol_p50 = (d50 * km_per_day) if np.isfinite(d50) and np.isfinite(km_per_day) else (np.inf if np.isinf(d50) and np.isfinite(km_per_day) else np.nan)
+        km_to_eol_p90 = (d90 * km_per_day) if np.isfinite(d90) and np.isfinite(km_per_day) else (np.inf if np.isinf(d90) and np.isfinite(km_per_day) else np.nan)
         eol_date_p10 = _safe_project_date(last_dt_ist, d10, horizon_days=REPORT_RUL_CAP_DAYS)
         eol_date_p50 = _safe_project_date(last_dt_ist, d50, horizon_days=REPORT_RUL_CAP_DAYS)
         eol_date_p90 = _safe_project_date(last_dt_ist, d90, horizon_days=REPORT_RUL_CAP_DAYS)
@@ -3422,6 +3416,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             'equivalent_full_cycles_epoch': equivalent_full_cycles_epoch,
             'km_run_till_date': km_run_till_date,
             'km_per_day_hist': km_per_day_hist,
+            'km_per_day_recent': km_per_day,
             'km_to_eol_p10': km_to_eol_p10,
             'km_to_eol_p50': km_to_eol_p50,
             'km_to_eol_p90': km_to_eol_p90,
