@@ -1784,6 +1784,7 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
             'Curr_kWh'  : m['Curr_kWh'],
             'Init_Ah'   : m['Init_Ah'],
             'Curr_Ah'   : m['Curr_Ah'],
+            'SOH_%'     : m['SOH_%'],
             'RUL_Likely': m['RUL_Likely'],
             'RUL_Best'  : m['RUL_Best'],
             'EOL_Likely': m['EOL_date_P50'],
@@ -3383,7 +3384,15 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         if vid in lstm_results:
             lr = lstm_results[vid]
             lb = lr['lookback']
-            soh_seq = lr['soh_pred']
+            soh_seq = np.array(lr['soh_pred'], dtype=float)
+            # LSTM has a lookback gap at the tail — NaN predictions for the last `lb` sessions.
+            # Fill those NaN slots with the corresponding XGBoost values so that soh_now
+            # (soh_seq[-1]) reflects the vehicle's current state, not a stale old prediction.
+            if 'soh_xgb' in g.columns:
+                xgb_vals = _finite_series(g['soh_xgb']).values.astype(float)
+                n_fill   = min(len(soh_seq), len(xgb_vals))
+                nan_mask = ~np.isfinite(soh_seq[:n_fill])
+                soh_seq[:n_fill] = np.where(nan_mask, xgb_vals[:n_fill], soh_seq[:n_fill])
             if axis_name == 'elapsed_days':
                 hrlfc_seq = (np.asarray(lr['hrlfc_seq'][lb:], dtype=float) - axis_zero) / 86400.0
             elif axis_name == 'session_idx':

@@ -5,6 +5,29 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v12.0 — RUL: Fill LSTM Trailing NaN with XGBoost Values (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v12.0-lstm-nan-tail-fill`
+
+### What changed
+- In `compute_all_rul`, when a vehicle has LSTM results, the LSTM `soh_pred` array now has its
+  trailing NaN values filled with the corresponding `soh_xgb` values before being passed to
+  `extrapolate_rul`. Fix: `soh_seq[:n_fill] = np.where(nan_mask, xgb_vals[:n_fill], soh_seq[:n_fill])`.
+- Only trailing NaN slots are affected; finite LSTM predictions are preserved as-is.
+
+### Why
+LSTM models have a lookback gap — the last `lb` sessions cannot produce a prediction because
+the model needs `lb` preceding sessions. These slots are NaN in `soh_pred`. For vehicle
+MC2V7SRT0TG132661 the last 5 LSTM predictions were NaN; the most recent finite LSTM value was
+75.14% (from an old session when the vehicle genuinely read low). After `_finite_series` NaN
+filtering, `soh_seq[-1]` = 75.14% which is below the EOL threshold of 80%, triggering
+`already_at_eol` and reporting 0 days RUL / an EOL date in the past.
+XGBoost predictions for the same recent sessions show 93–97% SOH — the vehicle is healthy.
+Filling the LSTM tail NaN with XGBoost values gives `soh_now` ≈ 94.5%, correctly clearing
+the already_at_eol flag.
+
+---
+
 ## v11.0 — RUL: Floor Rate p90 Spread + Min SE 20% + Manager Table Redesign (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v11.0-rul-spread-manager-table`
