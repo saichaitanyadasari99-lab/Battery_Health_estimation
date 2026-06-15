@@ -5,6 +5,31 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v7.0 — SOH Label Quality Gate: Minimum delta_soc = 10% (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v7.0-soh-label-dsoc-gate`
+
+### What changed
+- **`SOH_LABEL_MIN_DELTA_SOC = 10.0`** (new constant, ~line 120).
+  Sessions with `delta_soc_pct < 10%` no longer contribute their own `soh_label` to training.
+  They are NaN'd and replaced by linear interpolation from neighbouring high-quality sessions.
+  The existing 1pp session-to-session jump filter runs after, as before.
+
+### Why
+`implied_Q_Ah = ah_total / (delta_soc / 100)`. With BMS SOC at 1% integer resolution:
+  - delta_soc = 4%: ±1% rounding = ±25% error in implied_Q → ±25pp noise in soh_label
+  - delta_soc = 10%: ±1% rounding = ±10% error → ±10pp noise
+
+For a 608 Ah pack these small-swing sessions can give soh_label anywhere from 75% to 120%
+(clipped to 100%). The p10 of implied_Q for vehicle 383543 was 445 Ah vs median 567 Ah —
+entirely explained by small delta_soc amplification. These bad labels dragged XGBoost
+predictions down to 78% even though the vehicle's true SOH is ~91%.
+
+### pkl must be deleted before re-running
+soh_label changes → soh_smooth changes → XGBoost retrains.
+
+---
+
 ## v6.0 — Improved RUL: Recency-Weighted Slope + Slope-Sampling Uncertainty (2026-06-12)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v6.0-rul-weighted-slope`

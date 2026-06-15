@@ -117,6 +117,9 @@ PACK_FIXED_BASELINE_AH = {
     '208s2p': 300.0,
     '208s4p': 608.0,
 }
+SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
+                                       # Sessions below this are NaN'd and interpolated from neighbours.
+                                       # Keeps small-swing sessions (high SOC-rounding noise) out of training.
 RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
 RUL_TAIL_FRACTION           = 0.50    # Fraction of sessions used for WLS slope (recent half)
@@ -2810,12 +2813,19 @@ def compute_soh_labels(
 
         g['soh_label'] = (corrected_q / q_base_for_soh * 100).clip(0, 100.0)
 
-        # Filter sessions where |soh_label(n) - soh_label(n-1)| > 1 pp before
-        # smoothing. These are noisy one-off sessions (small delta_soc
-        # amplification, sensor glitch) that would otherwise lock the monotone
-        # floor. Replaced with interpolated values so XGBoost never trains on them.
-        _soh_arr   = g['soh_label'].values.astype(float)
-        _soh_diffs = np.abs(np.diff(_soh_arr, prepend=_soh_arr[0]))
+        # Step 1: NaN out low-delta_soc sessions before smoothing.
+        # implied_Q = ah_total / (delta_soc/100). With 1% SOC resolution, a
+        # session at delta_soc=4% has ±25% implied_Q noise from rounding alone.
+        # Sessions below SOH_LABEL_MIN_DELTA_SOC get their soh_label from
+        # linear interpolation of neighbouring high-quality sessions instead.
+        _soh_arr = g['soh_label'].values.astype(float)
+        if 'delta_soc_pct' in g.columns:
+            _dsoc = _finite_series(g['delta_soc_pct']).values.astype(float)
+            _soh_arr = np.where(_dsoc < SOH_LABEL_MIN_DELTA_SOC, np.nan, _soh_arr)
+
+        # Step 2: Filter sessions where |soh_label(n) - soh_label(n-1)| > 1 pp.
+        # Catches remaining sudden jumps from sensor glitches in good-delta_soc sessions.
+        _soh_diffs = np.abs(np.diff(_soh_arr, prepend=np.nanmedian(_soh_arr)))
         _soh_clean = np.where(_soh_diffs > 1.0, np.nan, _soh_arr)
         _soh_clean = (
             pd.Series(_soh_clean)
