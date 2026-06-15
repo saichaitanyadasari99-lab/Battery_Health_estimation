@@ -5,6 +5,29 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v9.0 — RUL: Minimum Data Span Gate + Max Slope Cap (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v9.0-rul-data-span-gate`
+
+### What changed
+- **`RUL_MIN_DATA_SPAN_DAYS = 120.0`** (new constant): Vehicles with fewer than 4 months of
+  session history are no longer trusted for WLS slope estimation. The slope is zeroed and they
+  fall through to the floor rate (0.3%/yr). Basis shows `floor_rate_insufficient_data`.
+- **`RUL_MAX_SLOPE_PCT_PER_YEAR = 20.0`** (new constant): After computing the WLS slope, if
+  the implied annual degradation rate exceeds 20%/yr, the slope is clamped to -20%/yr. Real-world
+  commercial EV fleet max is ~8-10%/yr; 20% gives headroom without allowing noise artifacts.
+- **`floor_basis` distinction**: `slope_basis` now reports `floor_rate_insufficient_data` vs
+  `floor_rate_no_degradation` so you can tell which vehicles lack data vs which are genuinely flat.
+
+### Why
+v8.0 switched slope input to `soh_xgb`, which is correct. But MC2R9SRT0TG132697 had only 71 days
+of session data — WLS over ~35 days of noisy soh_xgb produced a -0.06/10k slope that implied
+12%/yr degradation, giving a fake EOL of Oct 2027 for a 96% SOH vehicle. Guard 1 (120-day gate)
+fixes this directly. Guard 2 (20%/yr cap) catches any remaining cases where a short noisy tail
+slips through.
+
+---
+
 ## v8.0 — RUL: Use soh_xgb for Slope + Fix Floor Rate Dates (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v8.0-rul-soh-xgb-slope`

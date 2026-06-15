@@ -127,6 +127,10 @@ RUL_TAIL_MIN_SESSIONS       = 8       # Minimum sessions in tail window
 RUL_RECENCY_WEIGHT_K        = 2.0     # Exponential decay: newest=1.0, oldest=exp(-K) ~0.14
 RUL_SLOPE_SAMPLES           = 500     # Slope samples for P10/P50/P90
 RUL_FLOOR_PCT_PER_YEAR      = 0.3     # Minimum assumed SOH loss %/year (conservative floor)
+RUL_MIN_DATA_SPAN_DAYS      = 120.0   # Need ≥ 4 months of session history for WLS slope to be trusted;
+                                       # vehicles below this threshold fall through to floor rate
+RUL_MAX_SLOPE_PCT_PER_YEAR  = 20.0    # Hard cap: if implied degradation > 20%/yr, clamp to 20%/yr.
+                                       # Real-world EV fleet max is ~8-10%/yr; 20% gives headroom.
 RECENT_KM_WINDOW_DAYS       = 60      # Window for recent km/day estimate
 REPL_WINDOW = 8                       # Sessions per side for replacement medians
 REPL_PERSIST_M = 6                    # Lookahead window for persistence
@@ -3158,6 +3162,21 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     slope_se     = float(np.sqrt(weighted_sse / dof / max(weighted_ssx, 1e-12)))
     slope_se     = max(slope_se, abs(slope) * 0.05)   # at least 5% of slope magnitude
 
+    # --- Guard 1: insufficient data span → force floor rate ---
+    # WLS slope over < 4 months of data is dominated by session noise, not real degradation.
+    data_span_days = (hrlfc_seq[-1] - hrlfc_seq[0]) * hrlfc_to_days
+    if np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
+        slope = 0.0   # triggers floor-rate branch below
+
+    # --- Guard 2: annualised slope sanity cap ---
+    # If implied degradation > RUL_MAX_SLOPE_PCT_PER_YEAR (%/yr), clamp.
+    # This catches cases where a short noisy tail produces a wildly steep slope.
+    if slope < RUL_MIN_NEG_SLOPE and hrlfc_to_days > 0:
+        slope_pct_per_year = slope / hrlfc_to_days * 365.0
+        if slope_pct_per_year < -RUL_MAX_SLOPE_PCT_PER_YEAR:
+            slope = (-RUL_MAX_SLOPE_PCT_PER_YEAR / 365.0) * hrlfc_to_days
+            slope_se = abs(slope) * 0.10   # widen SE after clamping
+
     # --- Floor degradation rate (conservative estimate for flat/new vehicles) ---
     hrlfc_per_year = (365.0 / hrlfc_to_days) if hrlfc_to_days > 0 else np.nan
     floor_slope = (-(RUL_FLOOR_PCT_PER_YEAR / hrlfc_per_year)
@@ -3203,22 +3222,27 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
             'slope_basis'   : slope_basis + '_det_fallback',
         }
 
-    # No degradation detected in tail — use floor rate for a conservative upper-bound estimate
+    # No degradation detected in tail (or guards zeroed the slope) —
+    # use floor rate for a conservative upper-bound estimate.
     if np.isfinite(floor_slope) and soh_now > eol:
         rul_floor_h   = max(0.0, (eol - soh_now) / floor_slope)
         rul_floor_d   = rul_floor_h * hrlfc_to_days
+        if np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
+            floor_basis = 'floor_rate_insufficient_data'
+        else:
+            floor_basis = 'floor_rate_no_degradation'
         return {
             'phase2_slope'  : slope,
             'slope_se'      : slope_se,
             'soh_now'       : soh_now,
             'hrlfc_now'     : hrlfc_now,
-            'rul_hrlfc_p10' : np.nan,       # confirmed degradation not detected
-            'rul_hrlfc_p50' : rul_floor_h,  # floor-rate estimate (0.3%/yr)
+            'rul_hrlfc_p10' : np.nan,
+            'rul_hrlfc_p50' : rul_floor_h,
             'rul_hrlfc_p90' : rul_floor_h,
             'rul_days_p10'  : np.nan,
             'rul_days_p50'  : rul_floor_d,
             'rul_days_p90'  : rul_floor_d,
-            'slope_basis'   : 'floor_rate_no_degradation',
+            'slope_basis'   : floor_basis,
         }
 
     # SOH already at or below EOL
