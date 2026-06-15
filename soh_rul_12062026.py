@@ -132,6 +132,9 @@ RUL_MIN_DATA_SPAN_DAYS      = 120.0   # Need ≥ 4 months of session history for
 RUL_MAX_SLOPE_PCT_PER_YEAR  = 20.0    # Hard cap: if implied degradation > 20%/yr, clamp to 20%/yr.
                                        # Real-world EV fleet max is ~8-10%/yr; 20% gives headroom.
 RECENT_KM_WINDOW_DAYS       = 60      # Window for recent km/day estimate
+TOTAL_DISTANCE_MAX_KM       = 500_000.0  # Fault-code filter: INT32_MAX/100 ≈ 21,474,836 is a known
+                                          # telematics overflow sentinel; any value above 500k km is
+                                          # physically impossible for a city-fleet bus and is discarded.
 REPL_WINDOW = 8                       # Sessions per side for replacement medians
 REPL_PERSIST_M = 6                    # Lookahead window for persistence
 REPL_PERSIST_K = 3                    # Required confirmations in lookahead
@@ -957,10 +960,13 @@ def _cumulative_odometer(dist_arr: np.ndarray):
     """
     Compute total distance traveled across odometer resets.
     Returns (total_delta, last_raw_value).
-    A reset is detected when the value drops by more than 5% of the previous reading
-    or by more than 1000 units — whichever is smaller threshold.
+
+    Fault-code values (>= TOTAL_DISTANCE_MAX_KM, e.g. INT32_MAX/100 ≈ 21,474,836)
+    are dropped before processing. A reset is detected when the value drops by more
+    than 5% of the previous reading or by more than 1000 units.
     """
     vals = dist_arr[np.isfinite(dist_arr)]
+    vals = vals[vals < TOTAL_DISTANCE_MAX_KM]   # discard sensor fault codes
     if len(vals) == 0:
         return np.nan, np.nan
     if len(vals) == 1:
@@ -3360,14 +3366,9 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
 
         dist_vals = _finite_series(raw_v['totalDistance']) if 'totalDistance' in raw_v.columns else pd.Series(dtype=float)
         _dist_arr = dist_vals.dropna().values.astype(float)
-        km_delta, _km_last_raw = _cumulative_odometer(_dist_arr)  # total distance traveled across resets
-        # Auto-detect meters: if implied km/day > 1500 (impossible for any road vehicle), divide by 1000
-        _dist_unit_factor = 1.0
-        if np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0:
-            if (km_delta / days_span) > 1500:
-                _dist_unit_factor = 1.0 / 1000.0
-        km_delta *= _dist_unit_factor
-        # km_run_till_date = total cumulative distance traveled (handles odometer resets correctly)
+        # _cumulative_odometer filters INT32_MAX/100 fault codes and handles resets
+        km_delta, _ = _cumulative_odometer(_dist_arr)
+        # km_run_till_date = total cumulative distance traveled (km, fault codes removed)
         km_run_till_date = km_delta
         km_per_day_hist = (km_delta / days_span) if (np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0) else np.nan
 
@@ -3380,7 +3381,6 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             if recent_dist.notna().sum() >= 5:
                 _recent_arr  = recent_dist.dropna().values.astype(float)
                 recent_km, _ = _cumulative_odometer(_recent_arr)
-                recent_km   *= _dist_unit_factor
                 km_per_day   = recent_km / RECENT_KM_WINDOW_DAYS if (np.isfinite(recent_km) and recent_km >= 0) else km_per_day_hist
         axis_span = (np.nanmax(axis_vals) - np.nanmin(axis_vals)) if np.isfinite(axis_vals).sum() >= 2 else np.nan
 

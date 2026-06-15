@@ -5,6 +5,28 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v12.2 — Distance: Filter INT32_MAX Fault Codes + Remove Meters Heuristic (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v12.2-distance-fault-filter`
+
+### What changed
+- Added constant `TOTAL_DISTANCE_MAX_KM = 500_000.0`.
+- `_cumulative_odometer` now drops all values `>= TOTAL_DISTANCE_MAX_KM` before processing.
+  This removes telematics sensor fault codes (e.g. `INT32_MAX / 100 ≈ 21,474,836`) which
+  appear as isolated spikes in `totalDistance`.
+- Removed the `/1000` meters auto-detection heuristic introduced in v11.1. Units throughout
+  this fleet are km; the 21M spike was a sensor fault code, not a unit issue.
+
+### Why
+`totalDistance` for 228171 shows a spike to exactly `21,474,836` — which equals
+`2^31 / 100 = 21,474,836.48`, a standard telematics overflow sentinel emitted when the
+sensor malfunctions or the counter overflows a 32-bit integer. The v11.1 "/1000 if >1500
+km/day" heuristic happened to produce a plausible-looking number (21,475 km) by accident,
+but was conceptually wrong. The correct fix is to discard the fault value entirely and
+compute cumulative distance from the valid readings on either side.
+
+---
+
 ## v12.1 — Distance: Cumulative Odometer Across Resets (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v12.1-odometer-reset`
