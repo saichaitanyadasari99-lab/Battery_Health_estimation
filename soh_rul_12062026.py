@@ -3333,6 +3333,12 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
 
         dist_vals = _finite_series(raw_v['totalDistance']) if 'totalDistance' in raw_v.columns else pd.Series(dtype=float)
         km_run_till_date = (dist_vals.max() - dist_vals.min()) if dist_vals.notna().sum() >= 2 else np.nan
+        # Auto-detect meters: if implied km/day > 1500 (impossible for any road vehicle), divide by 1000
+        _dist_unit_factor = 1.0
+        if np.isfinite(km_run_till_date) and np.isfinite(days_span) and days_span > 0:
+            if (km_run_till_date / days_span) > 1500:
+                _dist_unit_factor = 1.0 / 1000.0
+                km_run_till_date *= _dist_unit_factor
         km_per_day_hist = (km_run_till_date / days_span) if (np.isfinite(km_run_till_date) and np.isfinite(days_span) and days_span > 0) else np.nan
 
         # Recent km/day: use last RECENT_KM_WINDOW_DAYS days; fallback to historical average
@@ -3342,9 +3348,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             recent_rows  = raw_v[raw_v['_utc_num'] >= cutoff_utc]
             recent_dist  = _finite_series(recent_rows['totalDistance'])
             if recent_dist.notna().sum() >= 5:
-                recent_km    = float(recent_dist.max() - recent_dist.min())
-                recent_days  = float((recent_dist.index.max() - recent_dist.index.min()) if False
-                               else RECENT_KM_WINDOW_DAYS)
+                recent_km    = float(recent_dist.max() - recent_dist.min()) * _dist_unit_factor
                 km_per_day   = recent_km / RECENT_KM_WINDOW_DAYS if recent_km >= 0 else km_per_day_hist
         axis_span = (np.nanmax(axis_vals) - np.nanmin(axis_vals)) if np.isfinite(axis_vals).sum() >= 2 else np.nan
 
