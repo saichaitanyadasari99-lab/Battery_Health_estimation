@@ -5,6 +5,28 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v10.0 — RUL: Lifetime Slope Fallback for Floor Rate (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v10.0-rul-lifetime-slope-fallback`
+
+### What changed
+- When floor rate is used (WLS tail flat or data < 120 days), the code now checks whether
+  the vehicle has historically degraded > 2% (first vs last decile of soh_xgb).
+  If so, half the lifetime degradation rate is used as the floor instead of the fixed 0.3%/yr.
+- `slope_basis` now reports `floor_rate_lifetime_slope` for this path.
+- The 0.5× factor is conservative: it assumes future degradation will slow compared to history.
+
+### Why
+v9.0 correctly suppressed fake-steep slopes for data-sparse vehicles. But the fixed 0.3%/yr
+floor rate is too conservative for vehicles that have genuinely degraded — e.g.:
+  - MC2V2HRT0PH228160: soh_xgb dropped 10.2% over 534 days (7%/yr lifetime), recent tail flat
+    at ~88%. At 0.3%/yr → 25 years → "Beyond 5y horizon". Misleading for an 85.6% SOH vehicle.
+  - MC2V7SRT0TF131176: 6.9% drop over 146 days. Same issue.
+Using half the lifetime rate gives a realistic EOL estimate that reflects observed degradation
+while remaining conservative about future behavior.
+
+---
+
 ## v9.0 — RUL: Minimum Data Span Gate + Max Slope Cap (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v9.0-rul-data-span-gate`

@@ -3182,6 +3182,23 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     floor_slope = (-(RUL_FLOOR_PCT_PER_YEAR / hrlfc_per_year)
                    if np.isfinite(hrlfc_per_year) else np.nan)
 
+    # --- Lifetime slope fallback for floor rate ---
+    # If the vehicle has historically degraded > 2% (first vs last decile of soh_xgb)
+    # but the WLS tail is flat, use half the lifetime degradation rate as the floor.
+    # This prevents vehicles at e.g. 85% SOH from showing "Beyond 5y" just because
+    # their recent 50-session window is noisy/stable.
+    _n10    = max(3, len(soh_seq) // 10)
+    _s_early = float(np.nanmedian(soh_seq[:_n10]))
+    _s_late  = float(np.nanmedian(soh_seq[-_n10:]))
+    _h_early = float(np.nanmedian(hrlfc_seq[:_n10]))
+    _h_late  = float(np.nanmedian(hrlfc_seq[-_n10:]))
+    _life_drop = _s_early - _s_late
+    _life_span = _h_late - _h_early
+    if _life_drop > 2.0 and _life_span > 0 and data_span_days > 30:
+        _life_floor = -(_life_drop / _life_span) * 0.5   # half rate: future tends to slow
+        if np.isfinite(floor_slope) and _life_floor < floor_slope:
+            floor_slope = _life_floor
+
     # --- RUL via slope sampling ---
     if slope < RUL_MIN_NEG_SLOPE:
         slope_basis   = 'wls_tail_recency'
@@ -3229,6 +3246,8 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
         rul_floor_d   = rul_floor_h * hrlfc_to_days
         if np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
             floor_basis = 'floor_rate_insufficient_data'
+        elif _life_drop > 2.0 and np.isfinite(floor_slope) and floor_slope != -(RUL_FLOOR_PCT_PER_YEAR / hrlfc_per_year):
+            floor_basis = 'floor_rate_lifetime_slope'
         else:
             floor_basis = 'floor_rate_no_degradation'
         return {
