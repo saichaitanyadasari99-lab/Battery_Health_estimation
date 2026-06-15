@@ -3333,14 +3333,18 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         last_dt_ist = _utc_to_ist_datetime(last_utc) if np.isfinite(last_utc) else pd.NaT
 
         dist_vals = _finite_series(raw_v['totalDistance']) if 'totalDistance' in raw_v.columns else pd.Series(dtype=float)
-        km_run_till_date = (dist_vals.max() - dist_vals.min()) if dist_vals.notna().sum() >= 2 else np.nan
+        km_delta      = (dist_vals.max() - dist_vals.min()) if dist_vals.notna().sum() >= 2 else np.nan
+        km_odometer   = float(dist_vals.max()) if dist_vals.notna().sum() >= 1 else np.nan
         # Auto-detect meters: if implied km/day > 1500 (impossible for any road vehicle), divide by 1000
         _dist_unit_factor = 1.0
-        if np.isfinite(km_run_till_date) and np.isfinite(days_span) and days_span > 0:
-            if (km_run_till_date / days_span) > 1500:
+        if np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0:
+            if (km_delta / days_span) > 1500:
                 _dist_unit_factor = 1.0 / 1000.0
-                km_run_till_date *= _dist_unit_factor
-        km_per_day_hist = (km_run_till_date / days_span) if (np.isfinite(km_run_till_date) and np.isfinite(days_span) and days_span > 0) else np.nan
+        km_delta    *= _dist_unit_factor
+        km_odometer *= _dist_unit_factor
+        # km_run_till_date = current odometer reading (total lifetime km on this vehicle)
+        km_run_till_date = km_odometer
+        km_per_day_hist = (km_delta / days_span) if (np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0) else np.nan
 
         # Recent km/day: use last RECENT_KM_WINDOW_DAYS days; fallback to historical average
         km_per_day = km_per_day_hist
