@@ -1779,6 +1779,7 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
         m_show = pd.DataFrame({
             'Vehicle'   : m['Vehicle'],
             'KM_Run'    : m['KM_Run'],
+            'KM/Day'    : m['Daily_KM_Run'],
             'Init_kWh'  : m['Init_kWh'],
             'Curr_kWh'  : m['Curr_kWh'],
             'Init_Ah'   : m['Init_Ah'],
