@@ -956,17 +956,35 @@ def _finite_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan)
 
 
+def _remove_odometer_spikes(dist_series: pd.Series, spike_factor: float = 5.0) -> np.ndarray:
+    """
+    Remove transient spike outliers from a time-sorted totalDistance series.
+    Uses a centered rolling median (window=21): if a value exceeds spike_factor
+    times its local median it is treated as a transient jump and dropped.
+    The "settled afterwards" condition is naturally captured because center=True
+    includes post-spike values in the rolling window — a genuine spike surrounded
+    by normal readings gets flagged while a real sustained increase does not.
+    """
+    s = pd.to_numeric(dist_series, errors='coerce').astype(float)
+    s = s.replace([np.inf, -np.inf], np.nan)
+    # Hard cap on physically impossible values (INT32_MAX/100 sentinel etc.)
+    s[s >= TOTAL_DISTANCE_MAX_KM] = np.nan
+    roll_med = s.rolling(window=21, center=True, min_periods=3).median()
+    spike_mask = (roll_med > 0) & (s > spike_factor * roll_med)
+    spike_mask |= (roll_med.isna() | (roll_med == 0)) & (s > 10_000.0)
+    s[spike_mask] = np.nan
+    return s.dropna().values.astype(float)
+
+
 def _cumulative_odometer(dist_arr: np.ndarray):
     """
-    Compute total distance traveled across odometer resets.
+    Compute total distance traveled across legitimate odometer resets.
+    Input must be time-sorted and spike-cleaned (call _remove_odometer_spikes first).
     Returns (total_delta, last_raw_value).
-
-    Fault-code values (>= TOTAL_DISTANCE_MAX_KM, e.g. INT32_MAX/100 ≈ 21,474,836)
-    are dropped before processing. A reset is detected when the value drops by more
-    than 5% of the previous reading or by more than 1000 units.
+    A reset is detected when the value drops by more than 5% of the previous
+    reading or by more than 1000 km.
     """
     vals = dist_arr[np.isfinite(dist_arr)]
-    vals = vals[vals < TOTAL_DISTANCE_MAX_KM]   # discard sensor fault codes
     if len(vals) == 0:
         return np.nan, np.nan
     if len(vals) == 1:
@@ -3364,11 +3382,14 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         last_utc = utc_vals.max() if utc_vals.notna().sum() >= 1 else np.nan
         last_dt_ist = _utc_to_ist_datetime(last_utc) if np.isfinite(last_utc) else pd.NaT
 
-        dist_vals = _finite_series(raw_v['totalDistance']) if 'totalDistance' in raw_v.columns else pd.Series(dtype=float)
-        _dist_arr = dist_vals.dropna().values.astype(float)
-        # _cumulative_odometer filters INT32_MAX/100 fault codes and handles resets
-        km_delta, _ = _cumulative_odometer(_dist_arr)
-        # km_run_till_date = total cumulative distance traveled (km, fault codes removed)
+        # Sort by time before distance calc — unsorted order causes false resets in cumulative logic
+        _raw_dist_src = raw_v.sort_values('_utc_num') if '_utc_num' in raw_v.columns else raw_v
+        if 'totalDistance' in _raw_dist_src.columns:
+            _dist_clean = _remove_odometer_spikes(_raw_dist_src['totalDistance'])
+        else:
+            _dist_clean = np.array([], dtype=float)
+        km_delta, _ = _cumulative_odometer(_dist_clean)
+        # km_run_till_date = total cumulative distance traveled (km, spikes and fault codes removed)
         km_run_till_date = km_delta
         km_per_day_hist = (km_delta / days_span) if (np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0) else np.nan
 
@@ -3376,11 +3397,10 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         km_per_day = km_per_day_hist
         if np.isfinite(last_utc) and '_utc_num' in raw_v.columns and 'totalDistance' in raw_v.columns:
             cutoff_utc   = last_utc - RECENT_KM_WINDOW_DAYS * 86400
-            recent_rows  = raw_v[raw_v['_utc_num'] >= cutoff_utc]
-            recent_dist  = _finite_series(recent_rows['totalDistance'])
-            if recent_dist.notna().sum() >= 5:
-                _recent_arr  = recent_dist.dropna().values.astype(float)
-                recent_km, _ = _cumulative_odometer(_recent_arr)
+            recent_rows  = raw_v[raw_v['_utc_num'] >= cutoff_utc].sort_values('_utc_num')
+            if len(recent_rows) >= 5:
+                _recent_clean = _remove_odometer_spikes(recent_rows['totalDistance'])
+                recent_km, _ = _cumulative_odometer(_recent_clean)
                 km_per_day   = recent_km / RECENT_KM_WINDOW_DAYS if (np.isfinite(recent_km) and recent_km >= 0) else km_per_day_hist
         axis_span = (np.nanmax(axis_vals) - np.nanmin(axis_vals)) if np.isfinite(axis_vals).sum() >= 2 else np.nan
 

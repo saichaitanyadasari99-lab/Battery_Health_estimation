@@ -5,6 +5,32 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v12.3 — Distance: Time-Sort + Rolling-Median Spike Removal (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v12.3-odometer-spike-removal`
+
+### What changed
+- Added `_remove_odometer_spikes(dist_series, spike_factor=5.0)`:
+  uses a centered rolling median (window=21, `center=True`) to detect transient jumps.
+  If a value exceeds 5× its local rolling median it is dropped. The centered window
+  naturally captures the "settled afterwards" property — a spike surrounded by normal
+  values has a low rolling median and gets flagged; a genuine sustained increase has a
+  proportionally rising median and is kept.
+  Hard-cap (>= TOTAL_DISTANCE_MAX_KM) is applied first as a backstop.
+- `compute_all_rul` now **sorts `raw_v` by `_utc_num` before distance extraction**.
+  Without time-sorting, `_cumulative_odometer` saw values in arbitrary order, detected
+  hundreds of false "resets" (each adding a large delta), and summed them into 777M km.
+- Both the full-history and recent-60-day distance paths sort + spike-clean before
+  calling `_cumulative_odometer`.
+
+### Why
+v12.2 added the 500k absolute filter but not the time-sort. With unsorted data,
+`_cumulative_odometer` misidentified ordering artefacts as resets and accumulated
+the deltas, producing wildly incorrect km totals (e.g. 777,706,096 km for 228171).
+The spike-removal step also handles any fault-code values that fall below 500k.
+
+---
+
 ## v12.2 — Distance: Filter INT32_MAX Fault Codes + Remove Meters Heuristic (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v12.2-distance-fault-filter`
