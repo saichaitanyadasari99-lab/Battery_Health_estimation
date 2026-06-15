@@ -5,6 +5,28 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v8.0 — RUL: Use soh_xgb for Slope + Fix Floor Rate Dates (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v8.0-rul-soh-xgb-slope`
+
+### What changed
+- **RUL slope now uses `soh_xgb`** instead of `soh_display` (~line 3325).
+  `soh_display` has the confirmation gate applied — it makes artificial step changes
+  (gate accepts a new level after 30 sessions) and flat periods (while waiting to confirm).
+  The WLS slope on a step-change reads as extremely steep → EOL date too near (e.g. 440 days
+  for a 96% SOH vehicle). The flat periods give slope≈0 → NA for most vehicles.
+  `soh_xgb` is the raw model output without any gate — it shows the genuine gradual trend.
+- **Floor rate branch now returns p50 date** instead of NaN.
+  When no confirmed degradation is detected, `p50 = p90 = floor_rate estimate (0.3%/yr)`.
+  `p10` stays NaN (degradation not confirmed). Every vehicle now shows an EOL date in p50.
+
+### Why
+v6.0 introduced the WLS tail slope. v7.0 summary showed most vehicles as NA (flat soh_display
+→ zero slope) and two vehicles with unrealistically near EOL dates (confirmation gate step
+changes amplified by WLS). Both issues traced to the same root: wrong input column for slope.
+
+---
+
 ## v7.0 — SOH Label Quality Gate: Minimum delta_soc = 10% (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v7.0-soh-label-dsoc-gate`

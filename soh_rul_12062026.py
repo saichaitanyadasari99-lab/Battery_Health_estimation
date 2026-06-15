@@ -3212,11 +3212,11 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
             'slope_se'      : slope_se,
             'soh_now'       : soh_now,
             'hrlfc_now'     : hrlfc_now,
-            'rul_hrlfc_p10' : np.nan,          # degradation not confirmed
-            'rul_hrlfc_p50' : np.nan,
-            'rul_hrlfc_p90' : rul_floor_h,     # conservative floor-rate upper bound
+            'rul_hrlfc_p10' : np.nan,       # confirmed degradation not detected
+            'rul_hrlfc_p50' : rul_floor_h,  # floor-rate estimate (0.3%/yr)
+            'rul_hrlfc_p90' : rul_floor_h,
             'rul_days_p10'  : np.nan,
-            'rul_days_p50'  : np.nan,
+            'rul_days_p50'  : rul_floor_d,
             'rul_days_p90'  : rul_floor_d,
             'slope_basis'   : 'floor_rate_no_degradation',
         }
@@ -3322,7 +3322,10 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 hrlfc_seq = np.asarray(lr['hrlfc_seq'][lb:], dtype=float)
         else:
             hrlfc_seq = np.asarray(axis_vals, dtype=float)
-            soh_col   = 'soh_display' if 'soh_display' in g.columns else 'soh_xgb'
+            # Use raw XGBoost output for slope estimation — soh_display has the
+            # confirmation gate applied which creates artificial step changes and
+            # flat periods that make the WLS slope either too steep or zero.
+            soh_col   = 'soh_xgb' if 'soh_xgb' in g.columns else 'soh_display'
             soh_seq   = _finite_series(g[soh_col]).values
 
         q_base_ah = np.nan
