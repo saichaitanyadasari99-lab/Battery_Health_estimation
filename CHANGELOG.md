@@ -5,6 +5,36 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v12.4 — Distance: Percentile-Based Odometer Cleaning + Max as Odometer Reading (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v12.4-odometer-clean`
+
+### What changed
+- Replaced `_remove_odometer_spikes` + `_cumulative_odometer` with a single
+  `_clean_odometer(dist_series)` function:
+  1. Drop zeros (GPS-off glitches; sensor always falls back to real value).
+  2. Compute p5 and p95 of all non-zero values as the "main cluster" reference.
+  3. Drop values below `p5 / 100` (trip-counter / device-glitch low anomalies).
+  4. Drop values above `p95 * 100` (fault-code spikes, e.g. 21,474,836).
+  The 100× multiplier is intentionally wide — only values truly outside the cluster
+  are removed; genuine high odometer readings are never affected.
+- `km_run_till_date = max(clean values)` — the actual odometer reading on the vehicle,
+  not the delta within the observation window. If data starts at 43,862 km and ends at
+  121,629 km, km_run_till_date = 121,629 km (total km on vehicle, not 77,767 km delta).
+- `km_per_day` still uses `(max - min) / days_span` of the clean window for the usage rate.
+- Both full-history and recent-60-day paths use `_clean_odometer`.
+
+### Why
+v12.3 rolling-median approach failed for sustained fault-code blocks (e.g. 3,095 consecutive
+rows of 21,474,836) because the rolling median of a block equals the block value, so nothing
+gets flagged. The percentile approach works on the global distribution and removes any values
+far outside the main cluster regardless of how sustained they are.
+The 0-glitch / 0-row issue (causing 1.25B km in v12.3) is now handled by dropping zeros
+before computing percentiles.
+Verified for 228171: clean series 441,651 rows, odometer = 121,629 km, 227 km/day.
+
+---
+
 ## v12.3 — Distance: Time-Sort + Rolling-Median Spike Removal (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v12.3-odometer-spike-removal`
