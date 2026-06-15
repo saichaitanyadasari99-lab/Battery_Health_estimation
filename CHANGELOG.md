@@ -5,6 +5,31 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v12.1 — Distance: Cumulative Odometer Across Resets (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v12.1-odometer-reset`
+
+### What changed
+- Added `_cumulative_odometer(dist_arr)` helper that sums monotonically increasing segments
+  of `totalDistance`, detecting resets when the value drops by more than 5% of the previous
+  reading or by more than 1000 units. Returns `(total_delta, last_raw_value)`.
+- `km_run_till_date` now uses cumulative total distance across all resets instead of
+  `max(totalDistance)`. If an odometer reset occurred mid-life, the lifetime km is correctly
+  accumulated as segment1_delta + segment2_delta + …
+- `km_per_day` (recent 60-day window) also uses `_cumulative_odometer` so a reset inside the
+  window doesn't falsely show near-zero or near-max km/day.
+- Removed the now-redundant `km_odometer` (max) variable.
+
+### Why
+MC2V2HRT0PH228171's `totalDistance` resets from ~21,474,836 back to ~0.69 between Oct 2025
+and Mar 2026. The old `max - min` approach happened to give approximately the right delta in
+this case (since min ≈ 0), but `km_run_till_date = max` would read the old pre-reset peak
+rather than the true cumulative total. Any future vehicle where the data window starts after
+a prior partial run (min > 0) would get an undercount. The cumulative approach is correct
+regardless of how many resets occur or where in the data window the reset falls.
+
+---
+
 ## v12.0 — RUL: Fill LSTM Trailing NaN with XGBoost Values (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v12.0-lstm-nan-tail-fill`

@@ -953,6 +953,31 @@ def _finite_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan)
 
 
+def _cumulative_odometer(dist_arr: np.ndarray):
+    """
+    Compute total distance traveled across odometer resets.
+    Returns (total_delta, last_raw_value).
+    A reset is detected when the value drops by more than 5% of the previous reading
+    or by more than 1000 units — whichever is smaller threshold.
+    """
+    vals = dist_arr[np.isfinite(dist_arr)]
+    if len(vals) == 0:
+        return np.nan, np.nan
+    if len(vals) == 1:
+        return 0.0, float(vals[0])
+    cumulative = 0.0
+    seg_start  = vals[0]
+    prev       = vals[0]
+    for v in vals[1:]:
+        drop_threshold = max(abs(prev) * 0.05, 1000.0)
+        if v < prev - drop_threshold:
+            cumulative += max(0.0, prev - seg_start)
+            seg_start   = v
+        prev = v
+    cumulative += max(0.0, prev - seg_start)
+    return float(cumulative), float(prev)
+
+
 def _pick_axis_col(df: pd.DataFrame) -> str:
     """
     Prefer hrlfc_mid only when it has enough finite variation.
@@ -3334,17 +3359,16 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         last_dt_ist = _utc_to_ist_datetime(last_utc) if np.isfinite(last_utc) else pd.NaT
 
         dist_vals = _finite_series(raw_v['totalDistance']) if 'totalDistance' in raw_v.columns else pd.Series(dtype=float)
-        km_delta      = (dist_vals.max() - dist_vals.min()) if dist_vals.notna().sum() >= 2 else np.nan
-        km_odometer   = float(dist_vals.max()) if dist_vals.notna().sum() >= 1 else np.nan
+        _dist_arr = dist_vals.dropna().values.astype(float)
+        km_delta, _km_last_raw = _cumulative_odometer(_dist_arr)  # total distance traveled across resets
         # Auto-detect meters: if implied km/day > 1500 (impossible for any road vehicle), divide by 1000
         _dist_unit_factor = 1.0
         if np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0:
             if (km_delta / days_span) > 1500:
                 _dist_unit_factor = 1.0 / 1000.0
-        km_delta    *= _dist_unit_factor
-        km_odometer *= _dist_unit_factor
-        # km_run_till_date = current odometer reading (total lifetime km on this vehicle)
-        km_run_till_date = km_odometer
+        km_delta *= _dist_unit_factor
+        # km_run_till_date = total cumulative distance traveled (handles odometer resets correctly)
+        km_run_till_date = km_delta
         km_per_day_hist = (km_delta / days_span) if (np.isfinite(km_delta) and np.isfinite(days_span) and days_span > 0) else np.nan
 
         # Recent km/day: use last RECENT_KM_WINDOW_DAYS days; fallback to historical average
@@ -3354,8 +3378,10 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             recent_rows  = raw_v[raw_v['_utc_num'] >= cutoff_utc]
             recent_dist  = _finite_series(recent_rows['totalDistance'])
             if recent_dist.notna().sum() >= 5:
-                recent_km    = float(recent_dist.max() - recent_dist.min()) * _dist_unit_factor
-                km_per_day   = recent_km / RECENT_KM_WINDOW_DAYS if recent_km >= 0 else km_per_day_hist
+                _recent_arr  = recent_dist.dropna().values.astype(float)
+                recent_km, _ = _cumulative_odometer(_recent_arr)
+                recent_km   *= _dist_unit_factor
+                km_per_day   = recent_km / RECENT_KM_WINDOW_DAYS if (np.isfinite(recent_km) and recent_km >= 0) else km_per_day_hist
         axis_span = (np.nanmax(axis_vals) - np.nanmin(axis_vals)) if np.isfinite(axis_vals).sum() >= 2 else np.nan
 
         if axis_name == 'elapsed_days':
