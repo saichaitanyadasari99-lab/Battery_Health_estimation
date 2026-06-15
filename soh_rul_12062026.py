@@ -1761,17 +1761,35 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
             _fmt_eol_date(ts, d)
             for ts, d in zip(df['EOL_date_P90'].tolist(), pd.to_numeric(m['RUL_P90_days'], errors='coerce').tolist())
         ]
-        m_show = m[
-            [
-                'Vehicle', 'SOH_%', 'Status', 'Months_to_EOL',
-                'Distance_Travelled', 'Dist_Rem_Worst', 'Dist_Rem_Likely', 'Dist_Rem_Best', 'Daily_KM_Run',
-                'RUL_Worst', 'RUL_Likely', 'RUL_Best',
-                'EOL_Worst', 'EOL_date_P50', 'EOL_Best',
-                'Action'
-            ]
-        ]
-        m_show = m_show.sort_values(['Status', 'Vehicle'], key=lambda s: s.map({'Red': 0, 'Amber': 1, 'Green': 2, 'Unknown': 3}) if s.name == 'Status' else s).reset_index(drop=True)
-        print("\n[MANAGER TABLE] Vehicle SOH / Status / Timeline")
+        m['KM_Run'] = pd.to_numeric(df['KM_run_to_date'], errors='coerce').apply(
+            lambda v: f"{v:,.0f} km" if np.isfinite(v) else "NA"
+        )
+        m['Init_kWh'] = pd.to_numeric(df['InitCap_100%_kWh'], errors='coerce').apply(
+            lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"
+        )
+        m['Curr_kWh'] = pd.to_numeric(df['CurrentCap_kWh'], errors='coerce').apply(
+            lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"
+        )
+        m['Init_Ah'] = pd.to_numeric(df['InitCap_100%_Ah'], errors='coerce').apply(
+            lambda v: f"{v:.0f}" if np.isfinite(v) else "NA"
+        )
+        m['Curr_Ah'] = pd.to_numeric(df['CurrentCap_Ah'], errors='coerce').apply(
+            lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"
+        )
+        m_show = pd.DataFrame({
+            'Vehicle'   : m['Vehicle'],
+            'KM_Run'    : m['KM_Run'],
+            'Init_kWh'  : m['Init_kWh'],
+            'Curr_kWh'  : m['Curr_kWh'],
+            'Init_Ah'   : m['Init_Ah'],
+            'Curr_Ah'   : m['Curr_Ah'],
+            'RUL_Likely': m['RUL_Likely'],
+            'RUL_Best'  : m['RUL_Best'],
+            'EOL_Likely': m['EOL_date_P50'],
+            'EOL_Best'  : m['EOL_Best'],
+        })
+        m_show = m_show.sort_values('Vehicle').reset_index(drop=True)
+        print("\n[MANAGER TABLE] Vehicle Capacity / RUL Summary")
         _render_table(m_show)
 
         df_show = df.copy()
@@ -3160,7 +3178,7 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     weighted_ssx = float(np.sum(w_tail * (x_tail - x_w_mean) ** 2))
     dof          = max(tail_n - 2, 1)
     slope_se     = float(np.sqrt(weighted_sse / dof / max(weighted_ssx, 1e-12)))
-    slope_se     = max(slope_se, abs(slope) * 0.05)   # at least 5% of slope magnitude
+    slope_se     = max(slope_se, abs(slope) * 0.20)   # at least 20% of slope magnitude (model + future uncertainty)
 
     # --- Guard 1: insufficient data span → force floor rate ---
     # WLS slope over < 4 months of data is dominated by session noise, not real degradation.
@@ -3257,10 +3275,10 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
             'hrlfc_now'     : hrlfc_now,
             'rul_hrlfc_p10' : np.nan,
             'rul_hrlfc_p50' : rul_floor_h,
-            'rul_hrlfc_p90' : rul_floor_h,
+            'rul_hrlfc_p90' : rul_floor_h * 2.0,   # best-case: half the floor rate
             'rul_days_p10'  : np.nan,
             'rul_days_p50'  : rul_floor_d,
-            'rul_days_p90'  : rul_floor_d,
+            'rul_days_p90'  : rul_floor_d * 2.0,
             'slope_basis'   : floor_basis,
         }
 

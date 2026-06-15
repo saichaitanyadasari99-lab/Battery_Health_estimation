@@ -5,6 +5,28 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v11.0 — RUL: Floor Rate p90 Spread + Min SE 20% + Manager Table Redesign (2026-06-15)
+**File:** `soh_rul_12062026.py`
+**Tag:** `v11.0-rul-spread-manager-table`
+
+### What changed
+- **Floor rate p90 = 2× p50**: Previously `rul_days_p90 = rul_days_p50` for all floor-rate vehicles,
+  making "likely" and "best" dates identical. p90 now represents the best case (half the floor rate),
+  so the Best EOL date is ~2× further out than the Likely date.
+- **Min slope SE raised 5% → 20%**: WLS slope SE was floored at 5% of slope magnitude. This was too
+  tight — P10/P90 bands were almost indistinguishable even for noisy data. 20% gives a more realistic
+  spread (model uncertainty + future conditions).
+- **Manager table redesign**: `[MANAGER TABLE]` now shows exactly:
+  Vehicle | KM_Run | Init_kWh | Curr_kWh | Init_Ah | Curr_Ah | RUL_Likely | RUL_Best | EOL_Likely | EOL_Best
+
+### Why
+"Likely" and "Best" dates were near-identical for most vehicles, giving false precision.
+Floor rate had no uncertainty band at all. WLS uncertainty was unrealistically tight.
+Manager table had too many columns (status, action, distance remaining, daily km) that obscured
+the key numbers managers actually need.
+
+---
+
 ## v10.0 — RUL: Lifetime Slope Fallback for Floor Rate (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v10.0-rul-lifetime-slope-fallback`
