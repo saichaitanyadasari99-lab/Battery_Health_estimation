@@ -2640,8 +2640,15 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         sessions['aux_ah']        = np.nan
         sessions['cell_ah']       = sessions['ah_total']
 
-    # Implied capacity: Q = cell_Ah / (dSOC/100)  — aux-corrected, charging-based
+    # Implied capacity — two variants for side-by-side comparison:
+    #   implied_Q_Ah      : charger Ah / dSOC  (original, no aux correction)
+    #   implied_Q_Ah_cell : cell Ah   / dSOC  (aux-corrected, charging-based)
     sessions['implied_Q_Ah'] = np.where(
+        sessions['delta_soc_pct'] > 0,
+        sessions['ah_total'] / (sessions['delta_soc_pct'] / 100.0),
+        np.nan
+    )
+    sessions['implied_Q_Ah_cell'] = np.where(
         sessions['delta_soc_pct'] > 0,
         sessions['cell_ah'] / (sessions['delta_soc_pct'] / 100.0),
         np.nan
@@ -2887,6 +2894,15 @@ def compute_soh_labels(
         corrected_q = g['implied_Q_Ah'] * sensor_cal_factor
 
         g['soh_label'] = (corrected_q / q_base_for_soh * 100).clip(0, 100.0)
+
+        # Parallel aux-corrected label for comparison.
+        # Uses implied_Q_Ah_cell (charger_Ah - aux_Ah) with the same sensor_cal_factor
+        # and q_base_for_soh so the only difference is the aux subtraction.
+        if 'implied_Q_Ah_cell' in g.columns:
+            corrected_q_cell = g['implied_Q_Ah_cell'] * sensor_cal_factor
+            g['soh_label_cell'] = (corrected_q_cell / q_base_for_soh * 100).clip(0, 100.0)
+        else:
+            g['soh_label_cell'] = g['soh_label']
 
         # Step 1: NaN out low-delta_soc sessions before smoothing.
         # implied_Q = ah_total / (delta_soc/100). With 1% SOC resolution, a
@@ -3489,6 +3505,9 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
 
         rul = extrapolate_rul(hrlfc_seq, soh_seq, htd)
         soh_now = rul.get('soh_now', np.nan)
+        # Charge-based SOH variants for side-by-side comparison
+        soh_now_charge = float(_finite_series(g['soh_label']).iloc[-1]) if ('soh_label' in g.columns and len(_finite_series(g['soh_label'])) > 0) else np.nan
+        soh_now_cell   = float(_finite_series(g['soh_label_cell']).iloc[-1]) if ('soh_label_cell' in g.columns and len(_finite_series(g['soh_label_cell'])) > 0) else np.nan
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
         current_cap_ah = (init_cap_ah * soh_now / 100.0) if np.isfinite(init_cap_ah) and np.isfinite(soh_now) else np.nan
         init_cap_kwh = (init_cap_ah * v_nom / 1000.0) if np.isfinite(init_cap_ah) and np.isfinite(v_nom) else np.nan
@@ -3578,6 +3597,8 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             'deliverable_ah_at_80_nominal': ah80_nom,
             'deliverable_kwh_at_80_nominal': e80_nom_kwh,
             'bms_correction_factor': float(_finite_series(g['bms_correction_factor']).median()) if 'bms_correction_factor' in g.columns else 1.0,
+            'soh_now_charge': soh_now_charge,
+            'soh_now_cell':   soh_now_cell,
         })
         rul_all[vid] = rul
 
@@ -4237,7 +4258,9 @@ def export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, s
     for vid, r in rul_all.items():
         summary_rows.append({
             'vehicle_id': vid,
-            'soh_now_pct': r.get('soh_now', np.nan),
+            'soh_now_pct':        r.get('soh_now', np.nan),
+            'soh_now_charge_pct': r.get('soh_now_charge', np.nan),
+            'soh_now_cell_pct':   r.get('soh_now_cell', np.nan),
             'init_capacity_ah': r.get('init_capacity_ah', np.nan),
             'init_capacity_kwh': r.get('init_capacity_kwh', np.nan),
             'current_capacity_ah': r.get('current_capacity_ah', np.nan),

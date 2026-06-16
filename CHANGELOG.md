@@ -5,6 +5,29 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v13.1 — Side-by-Side SOH Comparison: Original vs Aux-Corrected (2026-06-16) [branch: charging-based-soh]
+**File:** `soh_rul_12062026.py`
+**Tag:** `v13.1-soh-comparison`
+**Branch:** `charging-based-soh`
+
+### What changed
+- `build_session_table` now produces BOTH `implied_Q_Ah` (original, no aux correction) AND
+  `implied_Q_Ah_cell` (aux-corrected) for every charging session.
+- `compute_soh_labels` now produces BOTH `soh_label` (original) AND `soh_label_cell`
+  (aux-corrected) in parallel.
+- `compute_all_rul` computes `soh_now_charge` (last `soh_label` value) and `soh_now_cell`
+  (last `soh_label_cell` value) alongside the existing LSTM/XGBoost `soh_now`.
+- `fleet_summary.csv` now contains three SOH columns per vehicle:
+  - `soh_now_pct` — existing XGBoost/LSTM prediction (discharge-based, unchanged)
+  - `soh_now_charge_pct` — last session's charge-based SOH label (no aux correction)
+  - `soh_now_cell_pct` — last session's charge-based SOH label (aux-corrected)
+
+### Why
+Enables direct fleet-wide comparison of all three SOH estimation paths before deciding
+which to adopt as the primary signal.
+
+---
+
 ## v13.0 — Charging-Based SOH: HV Auxiliary Correction in implied_Q_Ah (2026-06-16) [branch: charging-based-soh]
 **File:** `soh_rul_12062026.py`
 **Tag:** `v13.0-charging-aux-correction`
