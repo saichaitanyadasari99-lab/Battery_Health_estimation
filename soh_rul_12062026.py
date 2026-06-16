@@ -2900,16 +2900,13 @@ def compute_soh_labels(
         if np.isfinite(q_ref_for_soh) and (q_ref_for_soh > 0) and (q_base_for_soh > q_ref_for_soh):
             sensor_cal_factor = min(q_base_for_soh / q_ref_for_soh, 1.30)
         g['sensor_cal_factor'] = sensor_cal_factor
-        corrected_q = g['implied_Q_Ah'] * sensor_cal_factor
 
-        g['soh_label'] = (corrected_q / q_base_for_soh * 100).clip(0, 100.0)
+        # sensor_cal_factor corrects a discharge-era assumption that is not valid for the
+        # charging current sensor — do not apply it to charging-based labels.
+        g['soh_label'] = (g['implied_Q_Ah'] / q_base_for_soh * 100).clip(0, 100.0)
 
-        # Parallel aux-corrected label for comparison.
-        # Uses implied_Q_Ah_cell (charger_Ah - aux_Ah) with the same sensor_cal_factor
-        # and q_base_for_soh so the only difference is the aux subtraction.
         if 'implied_Q_Ah_cell' in g.columns:
-            corrected_q_cell = g['implied_Q_Ah_cell'] * sensor_cal_factor
-            g['soh_label_cell'] = (corrected_q_cell / q_base_for_soh * 100).clip(0, 100.0)
+            g['soh_label_cell'] = (g['implied_Q_Ah_cell'] / q_base_for_soh * 100).clip(0, 100.0)
         else:
             g['soh_label_cell'] = g['soh_label']
 
