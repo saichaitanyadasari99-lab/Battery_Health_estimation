@@ -1723,6 +1723,8 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
         rows.append({
             'Vehicle': vid,
             'SOH_now_%': r.get('soh_now', np.nan),
+            'SOH_charge_%': r.get('soh_now_charge', np.nan),
+            'SOH_cell_%': r.get('soh_now_cell', np.nan),
             'InitCap_100%_Ah': r.get('init_capacity_ah', np.nan),
             'InitCap_100%_kWh': r.get('init_capacity_kwh', np.nan),
             'CurrentCap_Ah': r.get('current_capacity_ah', np.nan),
@@ -1808,16 +1810,20 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
         m['Curr_Ah'] = pd.to_numeric(df['CurrentCap_Ah'], errors='coerce').apply(
             lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"
         )
+        m['SOH_charge_%'] = pd.to_numeric(m['SOH_charge_%'], errors='coerce').apply(lambda v: f"{v:.1f}%" if np.isfinite(v) else "NA")
+        m['SOH_cell_%']   = pd.to_numeric(m['SOH_cell_%'],   errors='coerce').apply(lambda v: f"{v:.1f}%" if np.isfinite(v) else "NA")
         m_show = pd.DataFrame({
-            'Vehicle'   : m['Vehicle'],
-            'KM_Run'    : m['KM_Run'],
-            'KM/Day'    : m['Daily_KM_Run'],
-            'Init_kWh'  : m['Init_kWh'],
-            'Curr_kWh'  : m['Curr_kWh'],
-            'Init_Ah'   : m['Init_Ah'],
-            'Curr_Ah'   : m['Curr_Ah'],
-            'SOH_%'     : m['SOH_%'],
-            'RUL_Likely': m['RUL_Likely'],
+            'Vehicle'      : m['Vehicle'],
+            'KM_Run'       : m['KM_Run'],
+            'KM/Day'       : m['Daily_KM_Run'],
+            'Init_kWh'     : m['Init_kWh'],
+            'Curr_kWh'     : m['Curr_kWh'],
+            'Init_Ah'      : m['Init_Ah'],
+            'Curr_Ah'      : m['Curr_Ah'],
+            'SOH_%'        : m['SOH_%'],
+            'SOH_charge_%' : m['SOH_charge_%'],
+            'SOH_cell_%'   : m['SOH_cell_%'],
+            'RUL_Likely'   : m['RUL_Likely'],
             'RUL_Best'  : m['RUL_Best'],
             'EOL_Likely': m['EOL_date_P50'],
             'EOL_Best'  : m['EOL_Best'],
@@ -1828,7 +1834,8 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
 
         df_show = df.copy()
         for c in [
-            'SOH_now_%', 'InitCap_100%_Ah', 'InitCap_100%_kWh', 'CurrentCap_Ah', 'CurrentCap_kWh', 'EOLCap_80%_Ah',
+            'SOH_now_%', 'SOH_charge_%', 'SOH_cell_%',
+            'InitCap_100%_Ah', 'InitCap_100%_kWh', 'CurrentCap_Ah', 'CurrentCap_kWh', 'EOLCap_80%_Ah',
             'Charging_events', 'Eq_full_cycles',
             'KM_run_to_date',
             'RUL_P10_days', 'RUL_P50_days', 'RUL_P90_days',
@@ -1854,7 +1861,9 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
         # Cleaner technical summary for terminal readability.
         tech_show = pd.DataFrame({
             'Vehicle': df_show['Vehicle'].astype(str),
-            'SOH_%': df_show['SOH_now_%'].apply(lambda v: f"{v:.1f}%" if np.isfinite(v) else "NA"),
+            'SOH_%':        df_show['SOH_now_%'].apply(lambda v: f"{v:.1f}%" if np.isfinite(v) else "NA"),
+            'SOH_charge_%': df_show['SOH_charge_%'].apply(lambda v: f"{v:.1f}%" if np.isfinite(v) else "NA"),
+            'SOH_cell_%':   df_show['SOH_cell_%'].apply(lambda v: f"{v:.1f}%" if np.isfinite(v) else "NA"),
             'Init_Ah': df_show['InitCap_100%_Ah'].apply(lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"),
             'Curr_Ah': df_show['CurrentCap_Ah'].apply(lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"),
             'Init_kWh': df_show['InitCap_100%_kWh'].apply(lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"),
