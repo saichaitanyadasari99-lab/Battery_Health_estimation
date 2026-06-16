@@ -5,6 +5,39 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v13.0 — Charging-Based SOH: HV Auxiliary Correction in implied_Q_Ah (2026-06-16) [branch: charging-based-soh]
+**File:** `soh_rul_12062026.py`
+**Tag:** `v13.0-charging-aux-correction`
+**Branch:** `charging-based-soh` (main branch unchanged)
+
+### What changed
+- `build_session_table` now aggregates `hvAuxilaryPowerConsumption` min and max per session.
+- `delta_aux_kwh = hv_aux_max - hv_aux_min` = cumulative kWh consumed by HV auxiliaries
+  (pack cooling, BMS, HVAC) during the charging session. The field is a monotone cumulative
+  kWh counter; noise is handled by using max-min across the session.
+- `aux_ah = delta_aux_kwh / pack_voltage_kV` = Ah drawn from charger that never reached cells.
+- `cell_ah = max(0, ah_total - aux_ah)` = Ah that actually entered the battery cells.
+- `implied_Q_Ah = cell_ah / (delta_soc/100)` — now aux-corrected, charging-based only.
+
+### Why
+During charging, `chargingCurrent` measures current leaving the charger, which powers both
+the battery cells AND HV auxiliary loads (cooling fans, BMS, HVAC) running in parallel.
+The BMS SOC tracker only counts what enters the cells. So:
+  - Old: implied_Q = charger_Ah / (delta_soc/100)  ← overestimates capacity by aux drain
+  - New: implied_Q = cell_Ah / (delta_soc/100)     ← corrects for aux consumption
+
+Fleet analysis showed aux correction is 1.4–3.4% of charging Ah per session (1–2 kWh per
+charge), dropping corrected SOH estimates by ~2–4% vs uncorrected. Example results:
+  - E130222: 96.3% → 92.8%,  H133336: 77.9% → 75.9%,  228160: 94.4% → 92.4%
+H133336 is confirmed degraded at ~76% from the charging side independently.
+
+### New columns in session table
+- `delta_aux_kwh`: HV aux energy consumed during session (kWh)
+- `aux_ah`: Ah drawn by aux loads (not into cells)
+- `cell_ah`: Ah that actually entered the battery cells
+
+---
+
 ## v12.4 — Distance: Percentile-Based Odometer Cleaning + Max as Odometer Reading (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v12.4-odometer-clean`

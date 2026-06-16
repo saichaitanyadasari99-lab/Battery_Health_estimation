@@ -2599,6 +2599,9 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         'bms_ah'           : ('bms_ah',              'mean'),
         'bms_soh'          : ('bms_soh',             'mean'),
         'bms_init_cap'     : ('bms_init_cap',        'mean'),
+        # HV auxiliary energy counter (cumulative kWh) — min/max to compute delta per session
+        'hv_aux_min'       : ('hvAuxilaryPowerConsumption', 'min'),
+        'hv_aux_max'       : ('hvAuxilaryPowerConsumption', 'max'),
     }
     for key, (col, func) in optional.items():
         if col in chg.columns:
@@ -2621,10 +2624,26 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
     sessions['duration_min'] = (sessions['end_utc'] - sessions['start_utc']) / 60
 
-    # Implied capacity: Q = Ah / (dSOC/100)
+    # HV auxiliary correction: hvAuxilaryPowerConsumption is a cumulative kWh counter.
+    # delta_aux_kwh = energy consumed by cooling/BMS/HVAC during the charging session.
+    # This energy comes from the charger but never reaches the battery cells, so subtract
+    # it from ah_total before computing implied capacity.
+    if 'hv_aux_min' in sessions.columns and 'hv_aux_max' in sessions.columns:
+        sessions['delta_aux_kwh'] = (sessions['hv_aux_max'] - sessions['hv_aux_min']).clip(lower=0)
+        avg_v_kv = sessions['pack_v_mean'].where(
+            sessions['pack_v_mean'] > 100, 700.0
+        ) / 1000.0 if 'pack_v_mean' in sessions.columns else 0.700
+        sessions['aux_ah']  = sessions['delta_aux_kwh'] / avg_v_kv
+        sessions['cell_ah'] = (sessions['ah_total'] - sessions['aux_ah']).clip(lower=0)
+    else:
+        sessions['delta_aux_kwh'] = np.nan
+        sessions['aux_ah']        = np.nan
+        sessions['cell_ah']       = sessions['ah_total']
+
+    # Implied capacity: Q = cell_Ah / (dSOC/100)  — aux-corrected, charging-based
     sessions['implied_Q_Ah'] = np.where(
         sessions['delta_soc_pct'] > 0,
-        sessions['ah_total'] / (sessions['delta_soc_pct'] / 100.0),
+        sessions['cell_ah'] / (sessions['delta_soc_pct'] / 100.0),
         np.nan
     )
 
