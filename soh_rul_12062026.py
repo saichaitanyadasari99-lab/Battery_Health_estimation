@@ -85,6 +85,9 @@ SOFT_MIN_DROP_LABEL = 0.4             # Min total drop on smoothed pseudo-label
 INIT_CAPACITY_CYCLES = 25             # Auto-estimate init capacity from first N charging sessions
 HRLFC_WRAP_MOD      = 65536.0         # 16-bit counter wrap value (2^16)
 HRLFC_VALID_MAX     = 65600.0         # Valid range + sensor slack
+PACK_CHANGE_HRLFC_DROP_MIN = 200.0   # HRLFC must drop ≥ 200 units between sessions for BMS reset signal
+PACK_CHANGE_IMPLIED_Q_JUMP = 0.08    # Rolling implied-Q must shift ≥ 8% relative (confirms SOH level change)
+AUX_FRACTION_CAP           = 0.25    # aux_ah cannot exceed 25% of ah_total (HVAC ≤ 25% of charged energy)
 CAPACITY_SCALE_CANDIDATES = (0.5, 1.0, 2.0)  # x0.5/x1/x2 telemetry scaling fix
 CAPACITY_CAL_MAX_ERR_PCT = 15.0      # Use calibrated baseline only when match error is within this bound
 CELL_VOLT_MIN = 2.8                  # Cell minimum voltage (V)
@@ -1319,10 +1322,10 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
             chosen = {'series': 208, 'parallel': 4, 'nom_ah': 600.0}
             options_source = 'force_208_4p_from_q'
         elif q_data_med >= float(PACK_208_FORCE_2P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 304.0}
+            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 300.0}
             options_source = 'force_208_2p_from_q'
         elif q_data_med <= float(PACK_208_FORCE_1P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 152.0}
+            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 150.0}
             options_source = 'force_208_1p_from_q'
 
     chosen_series = int(chosen['series'])
@@ -2651,6 +2654,9 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         else:
             avg_v_kv = 0.700
         sessions['aux_ah']  = sessions['delta_aux_kwh'] / avg_v_kv
+        # Cap aux at AUX_FRACTION_CAP × ah_total: sustained elevated counter readings
+        # can pass the per-step cap but still over-subtract over many sessions.
+        sessions['aux_ah']  = sessions['aux_ah'].clip(upper=AUX_FRACTION_CAP * sessions['ah_total'])
         sessions['cell_ah'] = (sessions['ah_total'] - sessions['aux_ah']).clip(lower=0)
         ah_for_q = sessions['cell_ah']
     else:
@@ -2704,6 +2710,54 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------------------
+def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.Series:
+    """
+    Assign pack segment IDs per vehicle (0 = original pack, 1 = first swap, ...).
+    Pack change fires when BOTH signals align in the same session transition:
+      1. HRLFC drops >= PACK_CHANGE_HRLFC_DROP_MIN between consecutive sessions
+         — the BMS counter resets to a low value when a new pack is installed.
+      2. Rolling implied-Q (window=5) shifts >= PACK_CHANGE_IMPLIED_Q_JUMP relative
+         — confirms a real SOH level change, not just a telemetry counter glitch.
+    Either signal alone risks false positives: HRLFC glitches happen without pack
+    swaps, and large SOH swings occur during data anomalies.  Both together are
+    highly specific to physical pack replacement.
+    """
+    segments = pd.Series(0, index=g.index, dtype=int)
+    if 'hrlfc_end' not in g.columns or 'hrlfc_start' not in g.columns:
+        return segments
+    if 'implied_Q_Ah' not in g.columns:
+        return segments
+
+    hrlfc_drop = (
+        _finite_series(g['hrlfc_end']).shift(1) - _finite_series(g['hrlfc_start'])
+    ).fillna(0.0)
+    hrlfc_reset = hrlfc_drop > PACK_CHANGE_HRLFC_DROP_MIN
+
+    roll_q      = _finite_series(g['implied_Q_Ah']).rolling(window=5, min_periods=2).median()
+    roll_q_prev = roll_q.shift(1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        q_frac_change = (
+            (roll_q - roll_q_prev).abs() / roll_q_prev.where(roll_q_prev > 0)
+        ).fillna(0.0)
+    soh_jump = q_frac_change >= PACK_CHANGE_IMPLIED_Q_JUMP
+
+    is_pack_change = hrlfc_reset & soh_jump
+
+    seg, seg_list = 0, []
+    for chg in is_pack_change:
+        if chg:
+            seg += 1
+        seg_list.append(seg)
+
+    segments[:] = seg_list
+    n_changes = seg
+    if n_changes > 0:
+        vid = g['vehicle_id'].iloc[0] if 'vehicle_id' in g.columns else '?'
+        change_positions = [i for i, c in enumerate(seg_list) if c != (seg_list[i - 1] if i > 0 else 0)]
+        print(f"    [PackChange] {vid}: {n_changes} pack swap(s) detected at session(s) {change_positions}")
+    return segments
+
+
 # STEP 3 - FILTER + PSEUDO-SOH LABELS (dynamic per-vehicle bounds)
 # ------------------------------------------------------------------------------
 def compute_soh_labels(
@@ -2748,7 +2802,10 @@ def compute_soh_labels(
         g = g.sort_values(axis_col).reset_index(drop=True)
         x_axis = _finite_series(g[axis_col]).values.astype(float)
 
-        #  Per-vehicle dynamic Q bounds (5th95th percentile) 
+        # Detect pack swaps before IQR filter so we see the full implied_Q range.
+        g['pack_segment'] = _detect_pack_change_sessions(g)
+
+        #  Per-vehicle dynamic Q bounds (5th95th percentile)
         q_lo = g['implied_Q_Ah'].quantile(0.05)
         q_hi = g['implied_Q_Ah'].quantile(0.95)
         g = g[
@@ -2901,50 +2958,62 @@ def compute_soh_labels(
             sensor_cal_factor = min(q_base_for_soh / q_ref_for_soh, 1.30)
         g['sensor_cal_factor'] = sensor_cal_factor
 
-        # Rolling median of implied_Q_Ah (window=15, min_periods=5).
-        # SOC rounding adds ±(1%/delta_soc) noise per session but is symmetric → cancels in median.
-        # 15 sessions ≈ 2-3 weeks of operation; enough to suppress noise, short enough to track trends.
-        rolling_q = (
-            g['implied_Q_Ah']
-            .rolling(window=15, min_periods=5)
-            .median()
-        )
-        g['soh_label'] = (rolling_q / q_base_for_soh * 100).clip(0, 100.0)
+        # Rolling median of implied_Q_Ah (window=30, min_periods=5), computed per pack segment.
+        # Resetting at segment boundaries prevents old-pack sessions from diluting
+        # new-pack implied_Q after a battery swap (e.g. 71% old-pack corrupting 93% new-pack).
+        # SOC rounding noise is symmetric → cancels in the median within each segment.
+        segments = g['pack_segment'].values if 'pack_segment' in g.columns else np.zeros(len(g), dtype=int)
+        rolling_q     = pd.Series(np.nan, index=g.index)
+        hrlfc_rebased = pd.Series(np.nan, index=g.index)
+        _soh_arr_full = np.full(len(g), np.nan)
+        _soh_clean_full = np.full(len(g), np.nan)
 
-        # Step 1: NaN out low-delta_soc sessions before smoothing.
-        # implied_Q = ah_total / (delta_soc/100). With 1% SOC resolution, a
-        # session at delta_soc=4% has ±25% implied_Q noise from rounding alone.
-        # Sessions below SOH_LABEL_MIN_DELTA_SOC get their soh_label from
-        # linear interpolation of neighbouring high-quality sessions instead.
-        _soh_arr = g['soh_label'].values.astype(float)
-        if 'delta_soc_pct' in g.columns:
-            _dsoc = _finite_series(g['delta_soc_pct']).values.astype(float)
-            _soh_arr = np.where(_dsoc < SOH_LABEL_MIN_DELTA_SOC, np.nan, _soh_arr)
+        dsoc_arr = _finite_series(g['delta_soc_pct']).values.astype(float) if 'delta_soc_pct' in g.columns else None
 
-        # Step 2: Filter sessions where |soh_label(n) - soh_label(n-1)| > 1 pp.
-        # Catches remaining sudden jumps from sensor glitches in good-delta_soc sessions.
-        _soh_diffs = np.abs(np.diff(_soh_arr, prepend=np.nanmedian(_soh_arr)))
-        _soh_clean = np.where(_soh_diffs > 1.0, np.nan, _soh_arr)
-        _soh_clean = (
-            pd.Series(_soh_clean)
-            .interpolate(limit_direction='both')
-            .bfill()
-            .ffill()
-            .values
-        )
+        for seg_id in sorted(np.unique(segments)):
+            seg_mask  = np.where(segments == seg_id)[0]
+            seg_q     = _finite_series(g['implied_Q_Ah']).iloc[seg_mask]
+            seg_roll  = seg_q.rolling(window=30, min_periods=5).median()
+            rolling_q.iloc[seg_mask] = seg_roll.values
+
+            # Rebase HRLFC to 0 at start of each segment so XGBoost monotone
+            # constraint (SOH ↓ with HRLFC ↑) stays valid within each pack's life.
+            if 'hrlfc_mid' in g.columns:
+                seg_h  = _finite_series(g['hrlfc_mid']).iloc[seg_mask]
+                h_base = seg_h.min()
+                if np.isfinite(h_base):
+                    hrlfc_rebased.iloc[seg_mask] = (seg_h - h_base).values
+
+            # 1pp filter + soh_smooth per segment to avoid interpolating across the
+            # pack-change boundary (which would produce a false gradual SOH rise).
+            seg_soh = (seg_roll / q_base_for_soh * 100).clip(0, 100.0).values.astype(float)
+            if dsoc_arr is not None:
+                seg_dsoc = dsoc_arr[seg_mask]
+                seg_soh  = np.where(seg_dsoc < SOH_LABEL_MIN_DELTA_SOC, np.nan, seg_soh)
+            _soh_arr_full[seg_mask] = seg_soh
+
+            seg_diffs  = np.abs(np.diff(seg_soh, prepend=np.nanmedian(seg_soh)))
+            seg_clean  = np.where(seg_diffs > 1.0, np.nan, seg_soh)
+            seg_clean  = (
+                pd.Series(seg_clean)
+                .interpolate(limit_direction='both')
+                .bfill()
+                .ffill()
+                .values
+            )
+            _soh_clean_full[seg_mask] = seg_clean
+
+        g['soh_label']    = (rolling_q / q_base_for_soh * 100).clip(0, 100.0)
+        g['hrlfc_rebased'] = hrlfc_rebased
 
         g['soh_smooth'] = (
-            pd.Series(_soh_clean)
+            pd.Series(_soh_clean_full)
             .rolling(window=7, min_periods=2, center=True)
             .median()
             .bfill()
             .ffill()
             .values
         )
-        # _soft_monotone_curve intentionally removed from soh_smooth.
-        # XGBoost already enforces monotone via monotone_constraints=-1 on hrlfc.
-        # Applying it here locked the training target at the historical minimum,
-        # preventing the model from learning genuine recovery after noisy dips.
 
         out.append(g)
         print(
@@ -2978,7 +3047,7 @@ def compute_soh_labels(
 FEATURE_COLS = [
     'delta_soc_pct', 'ah_total', 'volt_spread_mean', 'volt_spread_eoc',
     'temp_max', 'dT_per_crate', 'avg_c_rate', 'pack_v_norm',
-    'ah_per_min', 'charge_efficiency', 'hrlfc_mid',
+    'ah_per_min', 'charge_efficiency', 'hrlfc_rebased',
     'duration_min', 'temp_spread_mean',
 ]
 

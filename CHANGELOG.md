@@ -5,6 +5,57 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v15.0 — Pack Change Detection + Aux Fraction Cap (2026-06-17)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Tag:** `v15.0-pack-change-aux-cap`
+
+### What changed
+
+**1. Pack change detection via dual signal: HRLFC drop + implied-Q jump**
+- New function `_detect_pack_change_sessions(g)` runs per vehicle before the rolling median.
+- A pack swap is flagged when BOTH fire at the same session transition:
+  - `hrlfc_end[i] − hrlfc_start[i+1] ≥ 200` — BMS counter resets on new pack (HRLFC is a
+    BMS parameter, so new pack → BMS reset → HRLFC drops to near 0).
+  - Rolling implied-Q (window=5) shifts ≥ 8% relative — confirms a real SOH level change,
+    not just a telemetry HRLFC glitch.
+- Either signal alone risks false positives; AND-gating makes detection precise.
+- New constants: `PACK_CHANGE_HRLFC_DROP_MIN = 200`, `PACK_CHANGE_IMPLIED_Q_JUMP = 0.08`.
+
+**2. Rolling median and soh_smooth reset per pack segment**
+- `implied_Q_Ah` rolling median (window=30) is now computed independently per segment.
+  Prevents old-pack sessions from diluting new-pack implied_Q in the rolling window.
+- The 1pp filter + interpolation (`soh_clean`) is also applied per segment.
+  This stops a false gradual SOH rise from being interpolated across the pack-change boundary
+  (which was making XGBoost learn a wrong recovery trajectory).
+
+**3. HRLFC rebased to 0 at each segment start**
+- New column `hrlfc_rebased` = `hrlfc_mid − first_hrlfc_in_segment`.
+- XGBoost `FEATURE_COLS` now uses `hrlfc_rebased` instead of `hrlfc_mid`.
+  The XGBoost monotone constraint (SOH ↓ with usage ↑) is only valid within one pack's
+  lifetime. With absolute HRLFC, the model saw high HRLFC → low SOH (old pack) then
+  higher HRLFC → high SOH (new pack), which the monotone constraint then locked at 71%.
+
+**4. Aux fraction cap**
+- After per-step cap, `aux_ah` is further clipped to `AUX_FRACTION_CAP × ah_total` (25%).
+  City bus HVAC typically uses 5–15% of pack energy in a charge session; sustained elevated
+  counter readings can pass the 2 kWh/step cap individually but still over-subtract across
+  50–100 sessions, causing whole-window dips in the rolling median.
+- New constant: `AUX_FRACTION_CAP = 0.25`.
+
+### Why
+Root cause of dip-then-recovery artefacts in TF131268, TG132661, 352914091383543, 352914091415931:
+- Per-step cap handles spike glitches but NOT sustained moderate overcorrection (1–2 kWh/step
+  × 50–100 sessions). Fraction cap is the missing backstop.
+
+Root cause of H133336 reporting 71% despite post-swap sessions showing 93%:
+- Rolling median straddled the old-pack / new-pack boundary → mixed 71% and 93% sessions.
+- 1pp filter interpolated across boundary → XGBoost learned a false slow-recovery path.
+- Absolute HRLFC monotone constraint locked predictions at 71% even at higher HRLFC.
+  All three fixed by pack segment isolation.
+
+---
+
 ## v14.1 — Aux Delta: Per-Step Cap to Filter Telemetry Glitches (2026-06-17)
 **File:** `soh_rul_12062026.py`
 **Branch:** `soh-label-quality`
