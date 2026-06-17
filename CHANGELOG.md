@@ -5,6 +5,31 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v14.1 — Aux Delta: Per-Step Cap to Filter Telemetry Glitches (2026-06-17)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Tag:** `v14.1-aux-step-cap`
+
+### What changed
+- Replaced `hv_aux_min`/`hv_aux_max` (max−min) aggregation with `_aux_kwh_delta` custom function.
+- `_aux_kwh_delta` sums **positive increments only** (counter resets ignored) and **caps each step
+  at `_AUX_MAX_KWH_PER_STEP = 2.0 kWh`** to filter single-row telemetry glitches.
+- Root cause: `hvAuxilaryPowerConsumption` counter had single-step jumps of 26–292 kWh
+  (p95 = 26 kWh/step; max = 292 kWh/step) — physically impossible at 1-min telemetry
+  (30 kW HVAC × 1 min = 0.5 kWh/step). These were inflating aux_ah → zeroing cell_ah
+  → pulling implied_Q to near-zero in affected sessions.
+
+### Why
+Per-session max−min was the original aggregation. Investigation revealed:
+- Counter resets (negative diffs) were handled by clip(lower=0).
+- But large positive jumps (data glitches, not resets) were not filtered.
+- After per-step cap: median session aux unchanged (5 kWh); anomalous sessions cleaned up.
+- Note: 6–17 anomalous sessions per vehicle are too rare (2% of sessions) to affect the
+  rolling-median-of-15 soh_label. The SOH results (71% H133336, 74.4% TG132661) represent
+  the true implied capacity from typical sessions, not artifacts.
+
+---
+
 ## v14.0 — SOH Label Quality: Aux Correction + Rolling Median + Remove sensor_cal_factor (2026-06-17)
 **File:** `soh_rul_12062026.py`
 **Branch:** `soh-label-quality`

@@ -2500,6 +2500,25 @@ def compute_soc_gain(soc_series, max_tail=MAX_TAIL_STRIP):
     return float(s[-1] - s[0]) if len(s) >= 2 else np.nan
 
 
+_AUX_MAX_KWH_PER_STEP = 2.0   # max kWh a single telemetry step can contribute
+                                # 30 kW bus HVAC at 1-min intervals → 0.5 kWh/step
+                                # 2.0 kWh/step allows ~4-min gaps or 120 kW peak — filters glitches
+
+def _aux_kwh_delta(series: pd.Series) -> float:
+    """Sum of positive increments of a cumulative kWh counter within a session.
+
+    Two classes of anomaly are removed:
+      1. Counter resets  — negative diffs are clipped to 0.
+      2. Single-step glitches — positive diffs > _AUX_MAX_KWH_PER_STEP are capped.
+         At 1-min telemetry a 26-292 kWh jump (observed) is physically impossible
+         (would need 1 560 – 17 520 kW); the true aux load is ≤ 30 kW → ≤ 0.5 kWh/min.
+    """
+    s = pd.Series(series).dropna()
+    if len(s) < 2:
+        return 0.0
+    return float(s.diff().clip(lower=0, upper=_AUX_MAX_KWH_PER_STEP).sum())
+
+
 # ------------------------------------------------------------------------------
 # STEP 2 - BUILD SESSION FEATURE TABLE
 # ------------------------------------------------------------------------------
@@ -2599,8 +2618,7 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         'bms_ah'           : ('bms_ah',              'mean'),
         'bms_soh'          : ('bms_soh',             'mean'),
         'bms_init_cap'     : ('bms_init_cap',        'mean'),
-        'hv_aux_min'       : ('hvAuxilaryPowerConsumption', 'min'),
-        'hv_aux_max'       : ('hvAuxilaryPowerConsumption', 'max'),
+        'delta_aux_kwh'    : ('hvAuxilaryPowerConsumption', _aux_kwh_delta),
     }
     for key, (col, func) in optional.items():
         if col in chg.columns:
@@ -2624,10 +2642,10 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
     sessions['duration_min'] = (sessions['end_utc'] - sessions['start_utc']) / 60
 
     # Subtract auxiliary loads (cooling, BMS) from charger-side Ah before computing implied Q.
-    # hvAuxilaryPowerConsumption is a cumulative kWh counter; delta per session = energy drawn by aux.
+    # hvAuxilaryPowerConsumption is a cumulative kWh counter; per-session delta is computed as
+    # sum of positive increments (_aux_kwh_delta) so counter resets don't inflate the value.
     # aux_ah = delta_kWh * 1000 / V_pack_avg.  Use 700V fallback for 608Ah packs, 396V for 300Ah.
-    if 'hv_aux_min' in sessions.columns and 'hv_aux_max' in sessions.columns:
-        sessions['delta_aux_kwh'] = (sessions['hv_aux_max'] - sessions['hv_aux_min']).clip(lower=0)
+    if 'delta_aux_kwh' in sessions.columns:
         if 'pack_v_mean' in sessions.columns:
             avg_v_kv = sessions['pack_v_mean'].where(sessions['pack_v_mean'] > 100, 700.0) / 1000.0
         else:
