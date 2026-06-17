@@ -61,7 +61,7 @@ warnings.filterwarnings('ignore')
 SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
-EXPECTED_CAPACITY_OPTIONS_AH = (104.5, 150, 300, 608)  # Fleet pack capacities
+EXPECTED_CAPACITY_OPTIONS_AH = (104.5, 150, 300, 600)  # Fleet pack capacities
 REPORT_RUL_CAP_DAYS = 1825.0          # RUL reporting horizon cap (days)
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
@@ -94,7 +94,7 @@ PACK_SERIES_OPTIONS = (96, 120, 208) # Known series cell configurations
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
     96: (104.5,),
     120: (104.5,),
-    208: (150.0, 300.0, 608.0),      # 208s1p / 208s2p / 208s4p
+    208: (150.0, 300.0, 600.0),      # 208s1p / 208s2p / 208s4p
 }
 PACK_CLASSIFY_W_SERIES = 0.45
 PACK_CLASSIFY_W_VOLT = 0.20
@@ -115,7 +115,7 @@ PACK_FIXED_BASELINE_AH = {
     '120s1p': 104.5,
     '208s1p': 150.0,
     '208s2p': 300.0,
-    '208s4p': 608.0,
+    '208s4p': 600.0,
 }
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
@@ -179,7 +179,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 608.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 600.0],
         'REPORT_RUL_CAP_DAYS': 1825.0,
         'SOFT_MIN_DROP_XGB': 0.8,
         'SOFT_MIN_DROP_LSTM': 0.8,
@@ -191,7 +191,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 2.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 608.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 600.0],
         'REPORT_RUL_CAP_DAYS': 1825.0,
         'SOFT_MIN_DROP_XGB': 0.6,
         'SOFT_MIN_DROP_LSTM': 0.6,
@@ -203,7 +203,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 0.5,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 608.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 600.0],
         'REPORT_RUL_CAP_DAYS': 1825.0,
         'SOFT_MIN_DROP_XGB': 1.0,
         'SOFT_MIN_DROP_LSTM': 1.0,
@@ -1259,7 +1259,7 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
         {'series': 120, 'parallel': 1, 'nom_ah': 104.5},
         {'series': 208, 'parallel': 1, 'nom_ah': 152.0},
         {'series': 208, 'parallel': 2, 'nom_ah': 304.0},
-        {'series': 208, 'parallel': 4, 'nom_ah': 608.0},
+        {'series': 208, 'parallel': 4, 'nom_ah': 600.0},
     ]
     scored = []
     for cand in candidates:
@@ -1316,7 +1316,7 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     chosen_series_pre = int(chosen['series'])
     if chosen_series_pre == 208 and q_q_count >= 8 and np.isfinite(q_data_med):
         if q_data_med >= float(PACK_208_FORCE_4P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 608.0}
+            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 600.0}
             options_source = 'force_208_4p_from_q'
         elif q_data_med >= float(PACK_208_FORCE_2P_Q_THRESHOLD_AH):
             chosen = {'series': 208, 'parallel': 2, 'nom_ah': 304.0}
@@ -2599,6 +2599,8 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         'bms_ah'           : ('bms_ah',              'mean'),
         'bms_soh'          : ('bms_soh',             'mean'),
         'bms_init_cap'     : ('bms_init_cap',        'mean'),
+        'hv_aux_min'       : ('hvAuxilaryPowerConsumption', 'min'),
+        'hv_aux_max'       : ('hvAuxilaryPowerConsumption', 'max'),
     }
     for key, (col, func) in optional.items():
         if col in chg.columns:
@@ -2621,10 +2623,28 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
     sessions['duration_min'] = (sessions['end_utc'] - sessions['start_utc']) / 60
 
-    # Implied capacity: Q = Ah / (dSOC/100)
+    # Subtract auxiliary loads (cooling, BMS) from charger-side Ah before computing implied Q.
+    # hvAuxilaryPowerConsumption is a cumulative kWh counter; delta per session = energy drawn by aux.
+    # aux_ah = delta_kWh * 1000 / V_pack_avg.  Use 700V fallback for 608Ah packs, 396V for 300Ah.
+    if 'hv_aux_min' in sessions.columns and 'hv_aux_max' in sessions.columns:
+        sessions['delta_aux_kwh'] = (sessions['hv_aux_max'] - sessions['hv_aux_min']).clip(lower=0)
+        if 'pack_v_mean' in sessions.columns:
+            avg_v_kv = sessions['pack_v_mean'].where(sessions['pack_v_mean'] > 100, 700.0) / 1000.0
+        else:
+            avg_v_kv = 0.700
+        sessions['aux_ah']  = sessions['delta_aux_kwh'] / avg_v_kv
+        sessions['cell_ah'] = (sessions['ah_total'] - sessions['aux_ah']).clip(lower=0)
+        ah_for_q = sessions['cell_ah']
+    else:
+        sessions['delta_aux_kwh'] = np.nan
+        sessions['aux_ah']  = np.nan
+        sessions['cell_ah'] = sessions['ah_total']
+        ah_for_q = sessions['ah_total']
+
+    # Implied capacity: Q = cell_Ah / (dSOC/100)
     sessions['implied_Q_Ah'] = np.where(
         sessions['delta_soc_pct'] > 0,
-        sessions['ah_total'] / (sessions['delta_soc_pct'] / 100.0),
+        ah_for_q / (sessions['delta_soc_pct'] / 100.0),
         np.nan
     )
 
@@ -2855,19 +2875,23 @@ def compute_soh_labels(
         g['config_epoch_id'] = int(config_epoch_id)
         g['pack_capacity_options_ah'] = ",".join(f"{float(v):.1f}" for v in cap_opts_local)
 
-        # Sensor calibration correction: Coulomb counting systematically underreads by ~7%
-        # (charging efficiency losses + SOC sensor bias at high-SOC). When STRICT baseline
-        # snaps q_base to nominal but sensor measures ~7% less for a fresh pack, the SOH
-        # ceiling is ~93% instead of 100%. Correct by scaling implied_Q_Ah up by q_base/q_raw.
-        # Cap at 30% — covers real sensor underread up to ~23% (max observed in fleet: ~19%).
-        # 1.15 was too tight for vehicles whose sensors under-read by 18-19%.
+        # sensor_cal_factor: kept for record-keeping only — NOT applied to soh_label.
+        # Pipeline is charge-based; the factor was designed for discharge sensor underread
+        # and incorrectly inflated SOH for charge paths (H133336: 1.30× hid true ~76% SOH).
         sensor_cal_factor = 1.0
         if np.isfinite(q_ref_for_soh) and (q_ref_for_soh > 0) and (q_base_for_soh > q_ref_for_soh):
             sensor_cal_factor = min(q_base_for_soh / q_ref_for_soh, 1.30)
         g['sensor_cal_factor'] = sensor_cal_factor
-        corrected_q = g['implied_Q_Ah'] * sensor_cal_factor
 
-        g['soh_label'] = (corrected_q / q_base_for_soh * 100).clip(0, 100.0)
+        # Rolling median of implied_Q_Ah (window=15, min_periods=5).
+        # SOC rounding adds ±(1%/delta_soc) noise per session but is symmetric → cancels in median.
+        # 15 sessions ≈ 2-3 weeks of operation; enough to suppress noise, short enough to track trends.
+        rolling_q = (
+            g['implied_Q_Ah']
+            .rolling(window=15, min_periods=5)
+            .median()
+        )
+        g['soh_label'] = (rolling_q / q_base_for_soh * 100).clip(0, 100.0)
 
         # Step 1: NaN out low-delta_soc sessions before smoothing.
         # implied_Q = ah_total / (delta_soc/100). With 1% SOC resolution, a

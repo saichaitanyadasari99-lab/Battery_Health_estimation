@@ -5,6 +5,43 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v14.0 — SOH Label Quality: Aux Correction + Rolling Median + Remove sensor_cal_factor (2026-06-17)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Tag:** `v14.0-aux-correction-rolling-median`
+
+### What changed
+1. **Aux current removal from implied_Q** (`build_session_table`):
+   - Added `hv_aux_min` / `hv_aux_max` aggregations from `hvAuxilaryPowerConsumption` (cumulative kWh counter).
+   - Per session: `delta_aux_kwh = max − min`, `aux_ah = delta_aux_kwh / V_pack_avg_kV`.
+   - `cell_ah = ah_total − aux_ah` (clipped ≥ 0). Used `cell_ah` instead of `ah_total` for `implied_Q_Ah`.
+   - Vehicles with no `hvAuxilaryPowerConsumption` data (e.g. 228159) fall back to `ah_total` unchanged.
+
+2. **Rolling median of implied_Q_Ah** (`compute_soh_labels`):
+   - `rolling_q = implied_Q_Ah.rolling(window=15, min_periods=5).median()` per vehicle.
+   - SOC rounding noise (±1% SOC resolution) is symmetric per session → cancels out in median.
+   - 15 sessions ≈ 2–3 weeks; suppresses noise while tracking real degradation trends.
+   - `soh_label = rolling_q / q_base × 100` (clipped 0–100).
+
+3. **Removed sensor_cal_factor from soh_label** (`compute_soh_labels`):
+   - Factor is still computed and stored as `g['sensor_cal_factor']` for diagnostics.
+   - No longer multiplied into soh_label. Pipeline is charge-based; the factor was designed for
+     discharge sensor underread and inflated labels (H133336: 1.30× hid true ~76% SOH).
+
+### Why
+Three root causes inflating soh_label were identified:
+- `sensor_cal_factor` scaled implied_Q up by up to 1.30× on the charge path (wrong direction).
+- Aux loads (cooling, BMS) consumed charger-side Ah that never entered the cells, inflating implied_Q.
+- 1% SOC resolution adds ±(1/delta_soc) random noise; worst at low delta_soc (±25% at 4% delta_soc).
+Together these caused H133336 to read ~100% SOH when its true degradation is ~76%.
+
+### Expected effect
+- H133336: soh_label drops from ~99% to ~76% (aux removal ~0.5% + no sensor_cal_factor + median).
+- Other vehicles: modest downward correction (1–3%) from aux removal; noise reduced by rolling median.
+- Sessions where `hvAuxilaryPowerConsumption` is all-NaN: no change (falls back to ah_total).
+
+---
+
 ## v12.4 — Distance: Percentile-Based Odometer Cleaning + Max as Odometer Reading (2026-06-15)
 **File:** `soh_rul_12062026.py`
 **Tag:** `v12.4-odometer-clean`
