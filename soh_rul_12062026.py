@@ -2109,6 +2109,7 @@ def _read_csv_resilient(path: Path) -> pd.DataFrame:
         'fuelLevel', 'chargingCurrent', 'battPackVoltage',
         'maxCellVoltage', 'minCellVoltage', 'maxCellTemp', 'minCellTemp',
         'battPowerIn', 'regenerationPower', 'hrlfc', 'totalDistance',
+        'hvAuxilaryPowerConsumption',
         'charge_calc', 'dt_sec', 'vehicleSpeed', 'chargingStatus', 'crankStatus',
         'motorCurrent', 'chg_power_calc',
         # Session / engineered fields from pre-cleaned files
