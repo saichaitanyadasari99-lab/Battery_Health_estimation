@@ -2511,16 +2511,27 @@ _AUX_MAX_KWH_PER_STEP = 2.0   # max kWh a single telemetry step can contribute
 def _aux_kwh_delta(series: pd.Series) -> float:
     """Sum of positive increments of a cumulative kWh counter within a session.
 
-    Two classes of anomaly are removed:
-      1. Counter resets  — negative diffs are clipped to 0.
-      2. Single-step glitches — positive diffs > _AUX_MAX_KWH_PER_STEP are capped.
-         At 1-min telemetry a 26-292 kWh jump (observed) is physically impossible
-         (would need 1 560 – 17 520 kW); the true aux load is ≤ 30 kW → ≤ 0.5 kWh/min.
+    Three classes of anomaly are removed:
+      1. Counter resets     — negative diffs clipped to 0.
+      2. Single-step spikes — positive diffs > _AUX_MAX_KWH_PER_STEP capped.
+         At 1-min telemetry 26-292 kWh jumps have been observed; physically
+         impossible (≤ 30 kW HVAC → ≤ 0.5 kWh/min).
+      3. BMS counter load events — when the counter sits at 0 (or NaN) for
+         initial rows then suddenly jumps to the stored accumulated value,
+         the first large increment after a near-zero previous value is a
+         BMS memory load, not real session consumption. Skip it.
     """
     s = pd.Series(series).dropna()
     if len(s) < 2:
         return 0.0
-    return float(s.diff().clip(lower=0, upper=_AUX_MAX_KWH_PER_STEP).sum())
+    diffs     = s.diff()
+    prev_vals = s.shift(1)
+    # If previous counter value was near-zero (<1 kWh) and the diff is large
+    # (>1 kWh), it is a BMS load event — counter went from uninitialized/reset
+    # to the stored cumulative value. Zero it out before capping.
+    load_mask = (prev_vals.fillna(0.0) < 1.0) & (diffs > 1.0)
+    diffs     = diffs.where(~load_mask, 0.0)
+    return float(diffs.clip(lower=0, upper=_AUX_MAX_KWH_PER_STEP).sum())
 
 
 # ------------------------------------------------------------------------------
