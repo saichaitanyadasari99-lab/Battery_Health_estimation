@@ -61,7 +61,7 @@ warnings.filterwarnings('ignore')
 SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
-EXPECTED_CAPACITY_OPTIONS_AH = (104.5, 150, 300, 600)  # Fleet pack capacities
+EXPECTED_CAPACITY_OPTIONS_AH = (104.5, 153.0, 306.0, 612.0)  # Fleet pack capacities
 REPORT_RUL_CAP_DAYS = 1825.0          # RUL reporting horizon cap (days)
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
@@ -97,7 +97,7 @@ PACK_SERIES_OPTIONS = (96, 120, 208) # Known series cell configurations
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
     96: (104.5,),
     120: (104.5,),
-    208: (150.0, 300.0, 600.0),      # 208s1p / 208s2p / 208s4p
+    208: (153.0, 306.0, 612.0),      # 208s1p / 208s2p / 208s4p
 }
 PACK_CLASSIFY_W_SERIES = 0.45
 PACK_CLASSIFY_W_VOLT = 0.20
@@ -116,9 +116,9 @@ BMS_INIT_CAP_OVERRIDE   = True        # Use BMS initial capacity as q_base when 
 PACK_FIXED_BASELINE_AH = {
     '96s1p': 104.5,
     '120s1p': 104.5,
-    '208s1p': 150.0,
-    '208s2p': 300.0,
-    '208s4p': 600.0,
+    '208s1p': 153.0,
+    '208s2p': 306.0,
+    '208s4p': 612.0,
 }
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
@@ -182,7 +182,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 600.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 1825.0,
         'SOFT_MIN_DROP_XGB': 0.8,
         'SOFT_MIN_DROP_LSTM': 0.8,
@@ -194,7 +194,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 2.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 600.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 1825.0,
         'SOFT_MIN_DROP_XGB': 0.6,
         'SOFT_MIN_DROP_LSTM': 0.6,
@@ -206,7 +206,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 0.5,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 152.0, 304.0, 600.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 1825.0,
         'SOFT_MIN_DROP_XGB': 1.0,
         'SOFT_MIN_DROP_LSTM': 1.0,
@@ -1260,9 +1260,9 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     candidates = [
         {'series': 96, 'parallel': 1, 'nom_ah': 104.5},
         {'series': 120, 'parallel': 1, 'nom_ah': 104.5},
-        {'series': 208, 'parallel': 1, 'nom_ah': 152.0},
-        {'series': 208, 'parallel': 2, 'nom_ah': 304.0},
-        {'series': 208, 'parallel': 4, 'nom_ah': 600.0},
+        {'series': 208, 'parallel': 1, 'nom_ah': 153.0},
+        {'series': 208, 'parallel': 2, 'nom_ah': 306.0},
+        {'series': 208, 'parallel': 4, 'nom_ah': 612.0},
     ]
     scored = []
     for cand in candidates:
@@ -1319,13 +1319,13 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     chosen_series_pre = int(chosen['series'])
     if chosen_series_pre == 208 and q_q_count >= 8 and np.isfinite(q_data_med):
         if q_data_med >= float(PACK_208_FORCE_4P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 600.0}
+            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 612.0}
             options_source = 'force_208_4p_from_q'
         elif q_data_med >= float(PACK_208_FORCE_2P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 300.0}
+            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 306.0}
             options_source = 'force_208_2p_from_q'
         elif q_data_med <= float(PACK_208_FORCE_1P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 150.0}
+            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 153.0}
             options_source = 'force_208_1p_from_q'
 
     chosen_series = int(chosen['series'])
