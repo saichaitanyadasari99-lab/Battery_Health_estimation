@@ -2977,7 +2977,20 @@ def compute_soh_labels(
         for seg_id in sorted(np.unique(segments)):
             seg_mask  = np.where(segments == seg_id)[0]
             seg_q     = _finite_series(g['implied_Q_Ah']).iloc[seg_mask]
-            seg_roll  = seg_q.rolling(window=50, min_periods=8).median()
+
+            # Outlier filter on implied_Q before rolling median.
+            # Sessions where implied_Q deviates >12% from the centered local median
+            # (window=15) are NaN'd and skipped in the rolling median — they get
+            # smoothed over by interpolation downstream.
+            # Threshold 0.88 catches both known artifact causes:
+            #   - Short-session SOC-quantization noise (TG132661: 0.81× normal)
+            #   - BMS current-integration transients (TF131268: 0.76× floor)
+            # while leaving genuine slow degradation (~1-2%/yr) untouched.
+            _ref_q      = seg_q.rolling(window=15, min_periods=5, center=True).median()
+            _q_ratio    = seg_q / _ref_q.where(_ref_q > 0)
+            seg_q_filt  = seg_q.where((_q_ratio >= 0.88) & (_q_ratio <= 1.12))
+
+            seg_roll  = seg_q_filt.rolling(window=50, min_periods=8).median()
             rolling_q.iloc[seg_mask] = seg_roll.values
 
             # Rebase HRLFC to 0 at start of each segment so XGBoost monotone
