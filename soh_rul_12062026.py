@@ -3589,12 +3589,14 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         # degradation projection but wrong for current-state reporting: once a
         # vehicle dips to e.g. 71% (pack change artifact) the monotone clamp
         # permanently locks Battery Health there even after recovery.
-        # Override with the last rolling-median soh_label which is a direct
-        # measurement of capacity from recent sessions, with no monotone applied.
-        if 'soh_label' in g.columns:
-            _soh_lbl = _finite_series(g['soh_label']).dropna()
-            if len(_soh_lbl) > 0:
-                soh_now = float(_soh_lbl.iloc[-1])
+        # Use soh_display (XGBoost + 1pp confirmation gate) instead: it is
+        # stable enough for customer display (gate suppresses session-to-session
+        # noise) yet has no monotone lock-in so it can recover after a dip.
+        _soh_now_col = 'soh_display' if 'soh_display' in g.columns else 'soh_label'
+        if _soh_now_col in g.columns:
+            _soh_now_vals = _finite_series(g[_soh_now_col]).dropna()
+            if len(_soh_now_vals) > 0:
+                soh_now = float(_soh_now_vals.iloc[-1])
                 rul['soh_now'] = soh_now
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
         current_cap_ah = (init_cap_ah * soh_now / 100.0) if np.isfinite(init_cap_ah) and np.isfinite(soh_now) else np.nan
