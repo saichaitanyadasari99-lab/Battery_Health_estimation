@@ -5,6 +5,60 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v15.2 — Battery Health: source soh_now from rolling-median label (2026-06-22)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Tag:** `v15.2-soh-now-from-label`
+
+### What changed
+
+**Battery Health (soh_now) now reads from `soh_label` instead of LSTM soh_pred**
+
+- After `extrapolate_rul` returns, `soh_now` is overridden with the last finite value of
+  `g['soh_label']` (the rolling median of `implied_Q_Ah`, window=50, per pack segment).
+- `rul['soh_now']` is also updated so downstream capacity calculations are consistent.
+
+### Why
+
+Root cause of Battery Health reading 71%/77%/81% while the trend line showed 93–94%:
+
+`_soft_monotone_curve` is applied to LSTM `soh_pred` to make the future-projection trend
+look physically correct (batteries degrade; the curve must not rise). This is right for the
+trajectory chart. But `soh_now = soh_pred[-1]`, so once the LSTM ever predicts a dip to
+71% (e.g. from old-pack sessions before a pack change), the monotone clamp permanently
+prevents `soh_pred[-1]` from rising above 71% — even when recent data clearly shows 93%.
+
+Specifically:
+- H133336: old pack degraded to 71% → LSTM stuck at 71% → Battery Health = 71.18%
+- TG132661: dip artifact to 73% → Battery Health = 76.96%
+- TF131268: dip artifact to 78% → Battery Health = 81.13%
+
+`soh_label` (rolling median of directly measured capacity) has no monotone constraint and
+correctly reflects the current state of whichever pack is currently installed. Using it as
+the current-state estimate separates concerns: LSTM for future projection; rolling median for
+present state.
+
+---
+
+## v15.1 — Rolling Window 30→50 to Reduce SOH Oscillation (2026-06-17)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Tag:** `v15.1-rolling-window-50`
+
+### What changed
+- Rolling median window for `soh_label` increased from 30 to 50 sessions.
+- Autocorrelation analysis of `implied_Q_Ah` residuals showed ~0.15 correlation at lags 1–15
+  (noise correlated over ~15 consecutive sessions). Window=30 gives ~22 effective independent
+  samples; window=50 gives ~37 — a 70% noise reduction. Observed SOH swing reduced from ±11pp
+  to ±3.5pp across the fleet.
+
+### Why
+Dip-then-recovery oscillation (±3pp swing) visible in IMEI_352914091549812 and other vehicles.
+Root cause: insufficient smoothing given autocorrelated implied_Q noise. Window=50 halves
+the residual oscillation while still using `min_periods=8` so early sessions still get labels.
+
+---
+
 ## v15.0 — Pack Change Detection + Aux Fraction Cap (2026-06-17)
 **File:** `soh_rul_12062026.py`
 **Branch:** `soh-label-quality`
