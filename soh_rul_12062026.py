@@ -3564,6 +3564,22 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             if len(_soh_now_vals) > 0:
                 soh_now = float(_soh_now_vals.iloc[-1])
                 rul['soh_now'] = soh_now
+
+        # If LSTM soh_pred (monotone-clamped) drove extrapolate_rul to conclude
+        # already_at_eol, but soh_display shows current SOH is above EOL threshold,
+        # the LSTM prediction was corrupted by old dip/pack-change data.
+        # Re-run RUL using soh_xgb (trained on clean rolling-median labels)
+        # so slope and EOL date are computed from the actual current trend.
+        if (rul.get('slope_basis') == 'already_at_eol'
+                and np.isfinite(soh_now) and soh_now > SOH_EOL):
+            _rr_col = 'soh_xgb' if 'soh_xgb' in g.columns else _soh_now_col
+            _rr_soh = _finite_series(g[_rr_col]).values.astype(float)
+            _rr_ax  = np.asarray(axis_vals, dtype=float)
+            _rr_ok  = np.isfinite(_rr_soh) & np.isfinite(_rr_ax)
+            if _rr_ok.sum() >= 8:
+                rul = extrapolate_rul(_rr_ax[_rr_ok], _rr_soh[_rr_ok], htd)
+                rul['soh_now'] = soh_now
+
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
         current_cap_ah = (init_cap_ah * soh_now / 100.0) if np.isfinite(init_cap_ah) and np.isfinite(soh_now) else np.nan
         init_cap_kwh = (init_cap_ah * v_nom / 1000.0) if np.isfinite(init_cap_ah) and np.isfinite(v_nom) else np.nan
