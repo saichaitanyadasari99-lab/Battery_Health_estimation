@@ -84,7 +84,7 @@ INIT_CAPACITY_CYCLES = 25             # Auto-estimate init capacity from first N
 HRLFC_WRAP_MOD      = 65536.0         # 16-bit counter wrap value (2^16)
 HRLFC_VALID_MAX     = 65600.0         # Valid range + sensor slack
 PACK_CHANGE_HRLFC_DROP_MIN = 200.0   # HRLFC must drop ≥ 200 units between sessions for BMS reset signal
-PACK_CHANGE_IMPLIED_Q_JUMP = 0.08    # Rolling implied-Q must shift ≥ 8% relative (confirms SOH level change)
+PACK_CHANGE_IMPLIED_Q_JUMP = 0.08    # Rolling implied-Q must jump UP ≥ 8% relative (new pack = higher SOH)
 AUX_FRACTION_CAP           = 0.25    # aux_ah cannot exceed 25% of ah_total (HVAC ≤ 25% of charged energy)
 CAPACITY_SCALE_CANDIDATES = (0.5, 1.0, 2.0)  # x0.5/x1/x2 telemetry scaling fix
 CAPACITY_CAL_MAX_ERR_PCT = 15.0      # Use calibrated baseline only when match error is within this bound
@@ -2668,11 +2668,10 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.Series:
     Pack change fires when BOTH signals align in the same session transition:
       1. HRLFC drops >= PACK_CHANGE_HRLFC_DROP_MIN between consecutive sessions
          — the BMS counter resets to a low value when a new pack is installed.
-      2. Rolling implied-Q (window=5) shifts >= PACK_CHANGE_IMPLIED_Q_JUMP relative
-         — confirms a real SOH level change, not just a telemetry counter glitch.
-    Either signal alone risks false positives: HRLFC glitches happen without pack
-    swaps, and large SOH swings occur during data anomalies.  Both together are
-    highly specific to physical pack replacement.
+      2. Rolling implied-Q (window=5) jumps UP >= PACK_CHANGE_IMPLIED_Q_JUMP relative
+         — new pack has higher SOH than the old degraded pack.
+    Requiring an UPWARD jump (not any large shift) rejects BMS artifact dips
+    (TF131268, TG132661) which go DOWN then recover — those are not pack swaps.
     """
     segments = pd.Series(0, index=g.index, dtype=int)
     if 'hrlfc_end' not in g.columns or 'hrlfc_start' not in g.columns:
@@ -2689,7 +2688,7 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.Series:
     roll_q_prev = roll_q.shift(1)
     with np.errstate(divide='ignore', invalid='ignore'):
         q_frac_change = (
-            (roll_q - roll_q_prev).abs() / roll_q_prev.where(roll_q_prev > 0)
+            (roll_q - roll_q_prev) / roll_q_prev.where(roll_q_prev > 0)
         ).fillna(0.0)
     soh_jump = q_frac_change >= PACK_CHANGE_IMPLIED_Q_JUMP
 
@@ -4262,16 +4261,6 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
     for vid, res in xgb_results.items():
         g = res['sessions'].copy()
 
-        # Show only the latest pack segment so customers never see old-pack
-        # degradation history (e.g. 71% dip before a battery replacement).
-        # Only truncate when the latest segment has enough sessions to draw
-        # a meaningful trend; otherwise fall back to all data.
-        if 'pack_segment' in g.columns and g['pack_segment'].max() > 0:
-            latest_seg = int(g['pack_segment'].max())
-            latest_g   = g[g['pack_segment'] == latest_seg]
-            if len(latest_g) >= 15:
-                g = latest_g.reset_index(drop=True)
-
         # Customer-facing axis: use elapsed days for readability and consistency.
         start_vals = _finite_series(g['start_utc']) if 'start_utc' in g.columns else pd.Series(dtype=float)
         min_needed = max(5, int(0.6 * max(len(g), 1)))
@@ -4302,6 +4291,19 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
             if np.any(md):
                 ax1.plot(xs[md], ys[md], color='crimson', lw=2, label='Health trend')
         ax1.axhline(SOH_EOL, color='red', linestyle=':', alpha=0.6, label='EOL 80%')
+
+        # Mark confirmed pack replacement events with a vertical dashed line.
+        if 'pack_segment' in g.columns:
+            _seg_vals  = g['pack_segment'].values
+            _chg_label = 'Pack replaced'
+            for _i in range(1, len(_seg_vals)):
+                if _seg_vals[_i] != _seg_vals[_i - 1]:
+                    _x_chg = x[_i]
+                    if np.isfinite(_x_chg):
+                        ax1.axvline(_x_chg, color='darkorange', linestyle='--',
+                                    alpha=0.8, lw=1.5, label=_chg_label)
+                        _chg_label = '_nolegend_'
+
         ax1.set_title(f"{vid} - Battery Health Trend")
         ax1.set_xlabel(x_label)
         ax1.set_ylabel('SOH (%)')
