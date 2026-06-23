@@ -41,13 +41,11 @@ Integration notes:
 
 import re
 import json
-import tensorflow as tf
 import pandas as pd
 import numpy as np
 import warnings
 from pathlib import Path
 from scipy import stats
-from itertools import chain
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -93,7 +91,6 @@ CAPACITY_CAL_MAX_ERR_PCT = 15.0      # Use calibrated baseline only when match e
 CELL_VOLT_MIN = 2.8                  # Cell minimum voltage (V)
 CELL_VOLT_MAX = 3.6                  # Cell maximum voltage (V)
 CELL_VOLT_NOM = 3.2                  # Cell nominal voltage (V) for series estimation
-PACK_SERIES_OPTIONS = (96, 120, 208) # Known series cell configurations
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
     96: (104.5,),
     120: (104.5,),
@@ -900,58 +897,6 @@ def _scan_vehicle_ids_from_input_path(path_str: str) -> set:
 
     return {v for v in ids if v}
 
-
-def _filter_outputs_by_vehicle_scope(
-    xgb_results: dict,
-    lstm_results: dict,
-    rul_all: dict,
-    replacement_events: pd.DataFrame,
-    vehicle_ids
-):
-    """Return reporting views filtered to a vehicle-id scope, leaving originals untouched."""
-    if not vehicle_ids:
-        return xgb_results, lstm_results, rul_all, replacement_events
-
-    scope = {_normalize_vehicle_id_text(v) for v in vehicle_ids if pd.notna(v)}
-    if not scope:
-        return xgb_results, lstm_results, rul_all, replacement_events
-
-    xgb_view = {k: v for k, v in (xgb_results or {}).items() if _normalize_vehicle_id_text(k) in scope}
-    lstm_view = {k: v for k, v in (lstm_results or {}).items() if _normalize_vehicle_id_text(k) in scope}
-    rul_view = {k: v for k, v in (rul_all or {}).items() if _normalize_vehicle_id_text(k) in scope}
-
-    repl_view = replacement_events
-    if isinstance(replacement_events, pd.DataFrame) and len(replacement_events) > 0 and 'vehicle_id' in replacement_events.columns:
-        repl_tmp = replacement_events.copy()
-        repl_view = repl_tmp[repl_tmp['vehicle_id'].map(_normalize_vehicle_id_text).isin(scope)].reset_index(drop=True)
-
-    return xgb_view, lstm_view, rul_view, repl_view
-
-
-def _guess_vehicle_scope_from_input_path(path_str: str, known_vehicle_ids=None):
-    """
-    Best-effort scope inference from input file name/path for cached-only incremental runs.
-    """
-    if not path_str:
-        return set()
-
-    known_norm = {_normalize_vehicle_id_text(v) for v in (known_vehicle_ids or [])}
-    p = Path(path_str)
-    text = str(p)
-    stem = p.stem
-
-    tokens = set()
-    if re.fullmatch(r'\d{10,17}(?:\.0+)?', stem):
-        tokens.add(_normalize_vehicle_id_text(stem))
-    for m in re.findall(r'\d{10,17}', text):
-        tokens.add(_normalize_vehicle_id_text(m))
-    for m in re.findall(r'IMEI[_-]?(\d{10,17})', text, flags=re.IGNORECASE):
-        tokens.add(_normalize_vehicle_id_text(m))
-
-    if not known_norm:
-        return tokens
-
-    return known_norm.intersection(tokens)
 
 
 def _finite_series(series: pd.Series) -> pd.Series:
@@ -2551,21 +2496,16 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
     # Fallback for datasets with unusable/missing bucket labels:
     # infer CHARGING rows from current and split into contiguous sessions.
     if len(chg) == 0 and 'chargingCurrent' in work.columns:
-        curr_abs = _finite_series(work['chargingCurrent']).abs().fillna(0.0)
-        chg_mask = curr_abs > float(SEG_EPS_CURR_ENTRY)
+        def _make_chg_mask(frame):
+            mask = _finite_series(frame['chargingCurrent']).abs().fillna(0.0) > float(SEG_EPS_CURR_ENTRY)
+            if 'vehicleSpeed' in frame.columns:
+                mask &= _finite_series(frame['vehicleSpeed']).fillna(0.0) <= max(10.0, 5.0 * float(SEG_EPS_SPEED))
+            return mask
 
-        if 'vehicleSpeed' in work.columns:
-            spd = _finite_series(work['vehicleSpeed'])
-            chg_mask &= spd.fillna(0.0) <= max(10.0, 5.0 * float(SEG_EPS_SPEED))
-
-        if int(chg_mask.sum()) > 0:
+        if int(_make_chg_mask(work).sum()) > 0:
             print("    [WARN] No CHARGING bucket rows found; inferring charging sessions from chargingCurrent.")
             work = work.sort_values(['vehicle_id', '_utc_num'], kind='mergesort').reset_index(drop=True)
-            curr_abs = _finite_series(work['chargingCurrent']).abs().fillna(0.0)
-            chg_mask = curr_abs > float(SEG_EPS_CURR_ENTRY)
-            if 'vehicleSpeed' in work.columns:
-                spd = _finite_series(work['vehicleSpeed'])
-                chg_mask &= spd.fillna(0.0) <= max(10.0, 5.0 * float(SEG_EPS_SPEED))
+            chg_mask = _make_chg_mask(work)
 
             utc = _finite_series(work['_utc_num']) if '_utc_num' in work.columns else pd.Series(
                 np.arange(len(work), dtype=float), index=work.index
@@ -3191,15 +3131,16 @@ def train_xgboost_soh(labeled: pd.DataFrame) -> dict:
 # STEP 5 - LSTM: SOH SEQUENCE -> TRAJECTORY
 # ------------------------------------------------------------------------------
 def build_lstm_sequences(soh_series: np.ndarray, lookback: int = 10):
-    X, y = [], []
-    for i in range(lookback, len(soh_series)):
-        X.append(soh_series[i - lookback:i])
-        y.append(soh_series[i])
-    return np.array(X)[..., np.newaxis], np.array(y)
+    from numpy.lib.stride_tricks import sliding_window_view
+    arr = np.asarray(soh_series, dtype=float)
+    X = sliding_window_view(arr[:-1], lookback)   # (N-lookback, lookback)
+    y = arr[lookback:]
+    return X[..., np.newaxis], y                   # X: (N-lookback, lookback, 1)
 
 
 def train_lstm_trajectory(xgb_results: dict, lookback: int = 10) -> dict:
     print("[5/6] Training LSTM trajectory model...")
+    import tensorflow as tf
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
