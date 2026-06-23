@@ -5,6 +5,44 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v15.6 — Two-level outlier filter: V-shape detector for sustained dips (2026-06-23)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Commit:** `1ac7bfe`
+
+### What changed
+
+Added a second level to the implied_Q outlier filter inside `compute_soh_labels()`.
+
+**Level 1 (existing):** Centered 15-session ±12% local window. Catches brief spike artifacts
+(TG132661 SOC-quantization noise) because healthy neighbors keep the reference median high.
+
+**Level 2 (new):** V-shape detector.
+- Computes `_fwd_max = expanding forward max` and `_bwd_max = expanding backward max` on the
+  level-1 filtered series.
+- `_ctx_max = min(_fwd_max, _bwd_max)` — the lower of the two surrounding context peaks.
+- Sessions where `implied_Q / _ctx_max < 0.85` are NaN'd as V-shaped artifacts.
+
+### Why
+
+TF131268's BMS Ah counter drift creates a sustained dip spanning ~60 sessions at 73% SOH.
+The level-1 local window fails because sessions deep in the dip have neighbors also in the
+dip → local median drops with them → ratio ≈ 1.0 → sessions pass the filter.
+
+XGBoost then trains through the dip, and LSTM extrapolates RUL from 73% instead of 90%,
+producing wildly pessimistic projections.
+
+The V-shape detector works because: both forward_max (from healthy pre-dip sessions) and
+backward_max (from healthy post-dip sessions) remain high → context_max is high → dip
+sessions at 73% have ratio 0.81 → below 0.85 → NaN'd.
+
+### Why it does not filter genuine degradation
+
+For a vehicle at end of life (80% SOH after 3 years): backward_max equals the current
+level (no future recovery) → context_max = current level → ratio = 1.0 → kept.
+
+---
+
 ## v15.5 — Customer chart: latest pack segment only; N/A distance when data insufficient (2026-06-23)
 **File:** `soh_rul_12062026.py`
 **Branch:** `soh-label-quality`
