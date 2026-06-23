@@ -5,6 +5,37 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v15.5 — Customer chart: latest pack segment only; N/A distance when data insufficient (2026-06-23)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Commit:** `e0d1b88`
+
+### What changed
+
+**Customer chart now shows only the latest pack segment**
+
+- When `pack_segment` column is present and max > 0, the chart slices to only the highest
+  segment index, provided that segment has ≥ 15 sessions (falls back to full history if fewer).
+- Prevents customers from seeing the old pack's degradation curve (e.g., H133336 plateau at
+  71% then a vertical jump to 92% when the pack was replaced) which looked like the battery
+  died and spontaneously healed.
+
+**Distance remaining shows "N/A (insufficient trend data)" when slope is unreliable**
+
+- `slope_basis` values of `floor_rate_*`, `insufficient_data`, or `already_at_eol` are now
+  treated as unreliable. Distance remaining is shown as "N/A (insufficient trend data)" instead
+  of multiplying a floor-rate RUL by daily km (which was producing values like 6,928,378 km).
+- Both the customer chart text box and the console print are updated consistently.
+
+### Why
+
+H133336 customer chart was alarming:
+- The 71% dip from the old (replaced) pack was still visible in the chart history.
+- Distance remaining showed ~6,928,378 km because the floor-rate RUL (used when slope cannot
+  be estimated, e.g., new pack < 35 days old) was being multiplied by a large daily-km figure.
+
+---
+
 ## v15.2 — Battery Health: source soh_now from rolling-median label (2026-06-22)
 **File:** `soh_rul_12062026.py`
 **Branch:** `soh-label-quality`
