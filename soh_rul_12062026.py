@@ -3688,12 +3688,17 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             f"best={_fmt_eol_date(rul.get('eol_date_p90_ist', pd.NaT), rul.get('rul_days_p90', np.nan))}"
         )
         print(f"Distance covered        : {_fmt_km(rul.get('km_run_till_date', np.nan))}")
-        print(
-            "Distance remaining      : "
-            f"worst={_fmt_km(rul.get('km_to_eol_p10', np.nan), approx=True)} | "
-            f"likely={_fmt_km(rul.get('km_to_eol_p50', np.nan), approx=True)} | "
-            f"best={_fmt_km(rul.get('km_to_eol_p90', np.nan), approx=True)}"
-        )
+        _sb = rul.get('slope_basis', '')
+        _rel = _sb not in ('', 'already_at_eol') and 'floor_rate' not in _sb and 'insufficient' not in _sb
+        if _rel:
+            print(
+                "Distance remaining      : "
+                f"worst={_fmt_km(rul.get('km_to_eol_p10', np.nan), approx=True)} | "
+                f"likely={_fmt_km(rul.get('km_to_eol_p50', np.nan), approx=True)} | "
+                f"best={_fmt_km(rul.get('km_to_eol_p90', np.nan), approx=True)}"
+            )
+        else:
+            print("Distance remaining      : N/A (insufficient trend data)")
 
     return rul_all
 
@@ -4247,6 +4252,17 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
     # -----------------------------
     for vid, res in xgb_results.items():
         g = res['sessions'].copy()
+
+        # Show only the latest pack segment so customers never see old-pack
+        # degradation history (e.g. 71% dip before a battery replacement).
+        # Only truncate when the latest segment has enough sessions to draw
+        # a meaningful trend; otherwise fall back to all data.
+        if 'pack_segment' in g.columns and g['pack_segment'].max() > 0:
+            latest_seg = int(g['pack_segment'].max())
+            latest_g   = g[g['pack_segment'] == latest_seg]
+            if len(latest_g) >= 15:
+                g = latest_g.reset_index(drop=True)
+
         # Customer-facing axis: use elapsed days for readability and consistency.
         start_vals = _finite_series(g['start_utc']) if 'start_utc' in g.columns else pd.Series(dtype=float)
         min_needed = max(5, int(0.6 * max(len(g), 1)))
@@ -4296,11 +4312,13 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
         )
         ax2.text(0.03, 0.48, f"Est. end-of-life date   : {_fmt_eol_date(rr.get('eol_date_p50_ist', pd.NaT), rr.get('rul_days_p50', np.nan))}", fontsize=10.2)
         ax2.text(0.03, 0.39, f"Distance covered        : {_fmt_km(rr.get('km_run_till_date', np.nan))}", fontsize=10.2)
-        ax2.text(
-            0.03, 0.30,
-            f"Distance remaining      : likely={_fmt_km(rr.get('km_to_eol_p50', np.nan), approx=True)}",
-            fontsize=10.2
+        _slope_basis = rr.get('slope_basis', '')
+        _reliable_slope = _slope_basis not in ('', 'already_at_eol') and 'floor_rate' not in _slope_basis and 'insufficient' not in _slope_basis
+        _dist_rem_text = (
+            f"likely={_fmt_km(rr.get('km_to_eol_p50', np.nan), approx=True)}"
+            if _reliable_slope else "N/A (insufficient trend data)"
         )
+        ax2.text(0.03, 0.30, f"Distance remaining      : {_dist_rem_text}", fontsize=10.2)
         ax2.text(0.03, 0.20, f"Cycles (equiv full)     : {rr.get('equivalent_full_cycles', np.nan):.0f}" if np.isfinite(rr.get('equivalent_full_cycles', np.nan)) else "Cycles (equiv full)     : NA", fontsize=9.8)
         ax2.text(0.03, 0.12, f"Partial charging events : {int(rr.get('partial_charging_events_count', 0))}" if np.isfinite(rr.get('partial_charging_events_count', np.nan)) else "Partial charging events : NA", fontsize=9.8)
         ax2.text(0.03, 0.06, f"Risk: {risk}", color=risk_color, fontsize=10.5, fontweight='bold')
