@@ -5,6 +5,38 @@ Each entry maps to a git tag so you can `git checkout <tag>` to get that exact c
 
 ---
 
+## v15.7 — Pack change detection upward-only; full history chart with pack-replaced marker (2026-06-23)
+**File:** `soh_rul_12062026.py`
+**Branch:** `soh-label-quality`
+**Commit:** `8ad1cdb`
+
+### What changed
+
+**Pack change detection — upward-only SOH jump**
+
+- Removed `abs()` from the rolling implied_Q fractional change calculation.
+- Detection now requires implied_Q to jump **UP** ≥ 8% (new pack has higher SOH than old pack).
+- Artifact dips (TF131268 BMS counter drift, TG132661 SOC quantization) go **DOWN** then
+  recover — they no longer trigger a false-positive pack change split.
+- H133336 (genuine replacement): old pack at 71% → new pack at 92% → upward jump ~21% → ✓ detected.
+
+**Customer chart — full history with orange pack-replaced marker**
+
+- Removed the v15.5 filter that truncated the chart to only the latest pack segment.
+- Full vehicle history is now shown so customers see the complete picture.
+- When a confirmed pack change is detected, an orange dashed vertical line labelled
+  "Pack replaced" is drawn at the transition point. Multiple swaps each get their own line
+  but only one legend entry.
+
+### Why
+
+v15.5 tried to hide old-pack history because pack change detection was unreliable (false
+positives for TF131268 and TG132661). v15.7 fixes detection reliability at the source, so
+hiding history is no longer needed. Showing the full history with a clear "Pack replaced"
+annotation is more informative for the customer than silently cutting off the old data.
+
+---
+
 ## v15.6 — Two-level outlier filter: V-shape detector for sustained dips (2026-06-23)
 **File:** `soh_rul_12062026.py`
 **Branch:** `soh-label-quality`
