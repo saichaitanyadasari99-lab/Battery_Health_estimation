@@ -2930,17 +2930,26 @@ def compute_soh_labels(
             seg_mask  = np.where(segments == seg_id)[0]
             seg_q     = _finite_series(g['implied_Q_Ah']).iloc[seg_mask]
 
-            # Outlier filter on implied_Q before rolling median.
-            # Sessions where implied_Q deviates >12% from the centered local median
-            # (window=15) are NaN'd and skipped in the rolling median — they get
-            # smoothed over by interpolation downstream.
-            # Threshold 0.88 catches both known artifact causes:
-            #   - Short-session SOC-quantization noise (TG132661: 0.81× normal)
-            #   - BMS current-integration transients (TF131268: 0.76× floor)
-            # while leaving genuine slow degradation (~1-2%/yr) untouched.
-            _ref_q      = seg_q.rolling(window=15, min_periods=5, center=True).median()
-            _q_ratio    = seg_q / _ref_q.where(_ref_q > 0)
-            seg_q_filt  = seg_q.where((_q_ratio >= 0.88) & (_q_ratio <= 1.12))
+            # Two-level outlier filter on implied_Q before rolling median.
+            #
+            # Level 1 — local ±12% window (catches brief spikes, e.g. TG132661 SOC-
+            # quantization noise). Centered 15-session window means neighbors are healthy
+            # for a brief artifact, so the ratio dips below 0.88 and the session is NaN'd.
+            _ref_q_local   = seg_q.rolling(window=15, min_periods=5, center=True).median()
+            _q_ratio_local = seg_q / _ref_q_local.where(_ref_q_local > 0)
+            seg_q_pass1    = seg_q.where((_q_ratio_local >= 0.88) & (_q_ratio_local <= 1.12))
+
+            # Level 2 — V-shape detector (catches sustained dips, e.g. TF131268 BMS Ah
+            # counter drift spanning 20-40 sessions). For a mid-data dip, both the forward
+            # running-max (from healthy pre-dip sessions) and the backward running-max (from
+            # healthy post-dip sessions) are high, so context_max is high and the dip ratio
+            # is low → NaN'd. For genuine end-of-life degradation, backward_max equals the
+            # current level → context_max = current level → ratio = 1.0 → kept.
+            _fwd_max     = seg_q_pass1.expanding(min_periods=3).max()
+            _bwd_max     = seg_q_pass1.iloc[::-1].expanding(min_periods=3).max().iloc[::-1]
+            _ctx_max     = pd.concat([_fwd_max, _bwd_max], axis=1).min(axis=1)
+            _q_ratio_ctx = seg_q / _ctx_max.where(_ctx_max > 0)
+            seg_q_filt   = seg_q_pass1.where((_q_ratio_ctx >= 0.85) | _ctx_max.isna())
 
             seg_roll  = seg_q_filt.rolling(window=50, min_periods=8).median()
             rolling_q.iloc[seg_mask] = seg_roll.values
