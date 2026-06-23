@@ -83,8 +83,9 @@ SOFT_MIN_DROP_LABEL = 0.4             # Min total drop on smoothed pseudo-label
 INIT_CAPACITY_CYCLES = 25             # Auto-estimate init capacity from first N charging sessions
 HRLFC_WRAP_MOD      = 65536.0         # 16-bit counter wrap value (2^16)
 HRLFC_VALID_MAX     = 65600.0         # Valid range + sensor slack
-PACK_CHANGE_HRLFC_DROP_MIN = 200.0   # HRLFC must drop ≥ 200 units between sessions for BMS reset signal
-PACK_CHANGE_IMPLIED_Q_JUMP = 0.08    # Rolling implied-Q must jump UP ≥ 8% relative (new pack = higher SOH)
+PACK_CHANGE_HRLFC_DROP_MIN      = 200.0  # HRLFC must drop ≥ 200 units between sessions for BMS reset signal
+PACK_CHANGE_IMPLIED_Q_JUMP      = 0.05   # Rolling implied-Q must jump UP ≥ 5% (catches 1-of-4 partial swap)
+PACK_CHANGE_IMPLIED_Q_JUMP_FULL = 0.20   # Jump ≥ 20% → treat as full replacement (≥ 3 of 4 packs)
 AUX_FRACTION_CAP           = 0.25    # aux_ah cannot exceed 25% of ah_total (HVAC ≤ 25% of charged energy)
 CAPACITY_SCALE_CANDIDATES = (0.5, 1.0, 2.0)  # x0.5/x1/x2 telemetry scaling fix
 CAPACITY_CAL_MAX_ERR_PCT = 15.0      # Use calibrated baseline only when match error is within this bound
@@ -2662,24 +2663,30 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------------------
-def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.Series:
+def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.DataFrame:
     """
     Assign pack segment IDs per vehicle (0 = original pack, 1 = first swap, ...).
     Pack change fires when BOTH signals align in the same session transition:
-      1. HRLFC drops >= PACK_CHANGE_HRLFC_DROP_MIN between consecutive sessions
-         — the BMS counter resets to a low value when a new pack is installed.
-      2. Rolling implied-Q (window=5) jumps UP >= PACK_CHANGE_IMPLIED_Q_JUMP relative
-         — new pack has higher SOH than the old degraded pack.
-    Requiring an UPWARD jump (not any large shift) rejects BMS artifact dips
-    (TF131268, TG132661) which go DOWN then recover — those are not pack swaps.
+      1. HRLFC drops >= PACK_CHANGE_HRLFC_DROP_MIN — BMS counter resets at service.
+      2. Rolling implied-Q (window=5) jumps UP >= PACK_CHANGE_IMPLIED_Q_JUMP (upward
+         only — rejects BMS artifact dips that go DOWN then recover).
+    Returns a DataFrame with columns:
+      pack_segment      (int)  — segment ID, increments at each detected swap
+      pack_change_type  (str)  — 'none' / 'partial' / 'full'
+      pack_change_jump  (float) — fractional implied_Q jump at transition, NaN elsewhere
     """
-    segments = pd.Series(0, index=g.index, dtype=int)
+    idx = g.index
+    _empty = pd.DataFrame({
+        'pack_segment':     pd.Series(0, index=idx, dtype=int),
+        'pack_change_type': pd.Series('none', index=idx, dtype=str),
+        'pack_change_jump': pd.Series(np.nan, index=idx, dtype=float),
+    })
     if 'hrlfc_end' not in g.columns or 'hrlfc_start' not in g.columns:
-        return segments
+        return _empty
     if 'implied_Q_Ah' not in g.columns:
-        return segments
+        return _empty
 
-    hrlfc_drop = (
+    hrlfc_drop  = (
         _finite_series(g['hrlfc_end']).shift(1) - _finite_series(g['hrlfc_start'])
     ).fillna(0.0)
     hrlfc_reset = hrlfc_drop > PACK_CHANGE_HRLFC_DROP_MIN
@@ -2690,9 +2697,11 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.Series:
         q_frac_change = (
             (roll_q - roll_q_prev) / roll_q_prev.where(roll_q_prev > 0)
         ).fillna(0.0)
-    soh_jump = q_frac_change >= PACK_CHANGE_IMPLIED_Q_JUMP
 
-    is_pack_change = hrlfc_reset & soh_jump
+    partial_jump   = (q_frac_change >= PACK_CHANGE_IMPLIED_Q_JUMP) & \
+                     (q_frac_change <  PACK_CHANGE_IMPLIED_Q_JUMP_FULL)
+    full_jump      = q_frac_change >= PACK_CHANGE_IMPLIED_Q_JUMP_FULL
+    is_pack_change = hrlfc_reset & (partial_jump | full_jump)
 
     seg, seg_list = 0, []
     for chg in is_pack_change:
@@ -2700,13 +2709,38 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.Series:
             seg += 1
         seg_list.append(seg)
 
-    segments[:] = seg_list
+    segments   = pd.Series(seg_list, index=idx, dtype=int)
+    chg_type   = pd.Series('none', index=idx, dtype=str)
+    chg_jump   = pd.Series(np.nan, index=idx, dtype=float)
+
+    chg_mask   = is_pack_change.values
+    chg_type.values[hrlfc_reset.values & partial_jump.values] = 'partial'
+    chg_type.values[hrlfc_reset.values & full_jump.values]    = 'full'
+    chg_jump[is_pack_change] = q_frac_change[is_pack_change]
+
     n_changes = seg
     if n_changes > 0:
         vid = g['vehicle_id'].iloc[0] if 'vehicle_id' in g.columns else '?'
-        change_positions = [i for i, c in enumerate(seg_list) if c != (seg_list[i - 1] if i > 0 else 0)]
-        print(f"    [PackChange] {vid}: {n_changes} pack swap(s) detected at session(s) {change_positions}")
-    return segments
+        p   = int(g['pack_parallel_count'].iloc[0]) if 'pack_parallel_count' in g.columns else 4
+        for _i, (chg, jfrac, ctype) in enumerate(
+                zip(is_pack_change, q_frac_change, chg_type)):
+            if chg:
+                _q_pre  = float(roll_q_prev.iloc[_i]) if np.isfinite(roll_q_prev.iloc[_i]) else np.nan
+                _q_post = float(roll_q.iloc[_i])      if np.isfinite(roll_q.iloc[_i])      else np.nan
+                _s_old  = _q_pre  / (p * 153.0) if np.isfinite(_q_pre)  else np.nan
+                _s_new  = _q_post / (p * 153.0) if np.isfinite(_q_post) else np.nan
+                _n_est  = round(jfrac * p * _s_old / (_s_new - _s_old)) \
+                          if (np.isfinite(_s_old) and np.isfinite(_s_new)
+                              and (_s_new - _s_old) > 0.01) else '?'
+                print(f"    [PackChange] {vid}: {ctype} swap at session {_i} "
+                      f"(jump={jfrac*100:.1f}%, ~{_n_est} of {p} packs replaced, "
+                      f"SOH {_s_old*100:.1f}%→{_s_new*100:.1f}%)")
+
+    return pd.DataFrame({
+        'pack_segment':     segments,
+        'pack_change_type': chg_type,
+        'pack_change_jump': chg_jump,
+    })
 
 
 # STEP 3 - FILTER + PSEUDO-SOH LABELS (dynamic per-vehicle bounds)
@@ -2754,7 +2788,10 @@ def compute_soh_labels(
         x_axis = _finite_series(g[axis_col]).values.astype(float)
 
         # Detect pack swaps before IQR filter so we see the full implied_Q range.
-        g['pack_segment'] = _detect_pack_change_sessions(g)
+        _pcd = _detect_pack_change_sessions(g)
+        g['pack_segment']      = _pcd['pack_segment'].values
+        g['pack_change_type']  = _pcd['pack_change_type'].values
+        g['pack_change_jump']  = _pcd['pack_change_jump'].values
 
         #  Per-vehicle dynamic Q bounds (5th95th percentile)
         q_lo = g['implied_Q_Ah'].quantile(0.05)
@@ -4293,16 +4330,25 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
         ax1.axhline(SOH_EOL, color='red', linestyle=':', alpha=0.6, label='EOL 80%')
 
         # Mark confirmed pack replacement events with a vertical dashed line.
+        # Orange = full replacement (≥ 20% jump, majority of packs swapped).
+        # Blue   = partial replacement (5–20% jump, 1 or 2 packs swapped).
         if 'pack_segment' in g.columns:
-            _seg_vals  = g['pack_segment'].values
-            _chg_label = 'Pack replaced'
+            _seg_vals   = g['pack_segment'].values
+            _chg_types  = g['pack_change_type'].values \
+                          if 'pack_change_type' in g.columns else ['full'] * len(g)
+            _lbl_full   = 'Pack replaced'
+            _lbl_part   = 'Partial replacement'
             for _i in range(1, len(_seg_vals)):
                 if _seg_vals[_i] != _seg_vals[_i - 1]:
                     _x_chg = x[_i]
+                    _ctype = _chg_types[_i]
+                    _color = 'darkorange' if _ctype == 'full' else 'steelblue'
+                    _lbl   = _lbl_full    if _ctype == 'full' else _lbl_part
                     if np.isfinite(_x_chg):
-                        ax1.axvline(_x_chg, color='darkorange', linestyle='--',
-                                    alpha=0.8, lw=1.5, label=_chg_label)
-                        _chg_label = '_nolegend_'
+                        ax1.axvline(_x_chg, color=_color, linestyle='--',
+                                    alpha=0.8, lw=1.5, label=_lbl)
+                        if _ctype == 'full': _lbl_full  = '_nolegend_'
+                        else:                _lbl_part  = '_nolegend_'
 
         ax1.set_title(f"{vid} - Battery Health Trend")
         ax1.set_xlabel(x_label)
