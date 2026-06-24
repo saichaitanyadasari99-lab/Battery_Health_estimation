@@ -40,6 +40,7 @@ Integration notes:
 """
 
 import re
+import sys
 import json
 import pandas as pd
 import numpy as np
@@ -2087,7 +2088,8 @@ def _read_csv_resilient(path: Path) -> pd.DataFrame:
             use_cols = None
 
     # Avoid dtype=object for all columns; that explodes memory on large CSVs.
-    read_kwargs = dict(low_memory=True, on_bad_lines='skip', memory_map=True)
+    read_kwargs = dict(low_memory=True, on_bad_lines='skip',
+                       memory_map=(sys.platform != 'win32'))
     if use_cols is not None:
         read_kwargs['usecols'] = use_cols
 
