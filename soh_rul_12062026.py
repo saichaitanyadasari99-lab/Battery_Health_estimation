@@ -2351,8 +2351,13 @@ def load_and_clean(path: str, since_utc: float = None, overlap_sec: float = 0.0)
         )
 
     # charge_calc: Coulomb counting (Ah = |I| * dt / 3600)
-    if 'charge_calc' not in df.columns and 'chargingCurrent' in df.columns:
-        df['charge_calc'] = (df['chargingCurrent'].abs() * df['dt_sec']) / 3600.0
+    # Prefer Net_Battery_Current_Hi_Res (BMS terminal current, already net of aux loads).
+    # Fall back to chargingCurrent (charger-side; aux subtraction applied later).
+    if 'charge_calc' not in df.columns:
+        if 'Net_Battery_Current_Hi_Res' in df.columns:
+            df['charge_calc'] = (df['Net_Battery_Current_Hi_Res'].abs() * df['dt_sec']) / 3600.0
+        elif 'chargingCurrent' in df.columns:
+            df['charge_calc'] = (df['chargingCurrent'].abs() * df['dt_sec']) / 3600.0
 
     # chg_power_calc: instantaneous charging power (W), only during CHARGING rows
     if 'chg_power_calc' not in df.columns:
@@ -2532,8 +2537,11 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
             )
         raise RuntimeError("[CRITICAL] Missing 'bucket' column and no charging rows could be inferred.")
 
-    if 'charge_calc' not in chg.columns and {'chargingCurrent', 'dt_sec'}.issubset(chg.columns):
-        chg['charge_calc'] = (chg['chargingCurrent'].abs() * chg['dt_sec']) / 3600.0
+    if 'charge_calc' not in chg.columns:
+        if 'Net_Battery_Current_Hi_Res' in chg.columns and 'dt_sec' in chg.columns:
+            chg['charge_calc'] = (chg['Net_Battery_Current_Hi_Res'].abs() * chg['dt_sec']) / 3600.0
+        elif {'chargingCurrent', 'dt_sec'}.issubset(chg.columns):
+            chg['charge_calc'] = (chg['chargingCurrent'].abs() * chg['dt_sec']) / 3600.0
 
     missing_required = [c for c in ('fuelLevel', 'charge_calc') if c not in chg.columns]
     if missing_required:
@@ -2599,11 +2607,19 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
     sessions['duration_min'] = (sessions['end_utc'] - sessions['start_utc']) / 60
 
-    # Subtract auxiliary loads (cooling, BMS) from charger-side Ah before computing implied Q.
-    # hvAuxilaryPowerConsumption is a cumulative kWh counter; per-session delta is computed as
-    # sum of positive increments (_aux_kwh_delta) so counter resets don't inflate the value.
-    # aux_ah = delta_kWh * 1000 / V_pack_avg.  Use 700V fallback for 608Ah packs, 396V for 300Ah.
-    if 'delta_aux_kwh' in sessions.columns:
+    # When Net_Battery_Current_Hi_Res is available it is measured at the battery terminals,
+    # so auxiliary loads are already excluded — no aux subtraction needed.
+    # For chargingCurrent (charger-side), subtract HVAC/aux loads via hvAuxilaryPowerConsumption.
+    _bms_current_used = 'Net_Battery_Current_Hi_Res' in chg.columns
+    if _bms_current_used:
+        sessions['delta_aux_kwh'] = np.nan
+        sessions['aux_ah']  = 0.0
+        sessions['cell_ah'] = sessions['ah_total']
+        ah_for_q = sessions['ah_total']
+    elif 'delta_aux_kwh' in sessions.columns:
+        # hvAuxilaryPowerConsumption is a cumulative kWh counter; per-session delta is computed as
+        # sum of positive increments (_aux_kwh_delta) so counter resets don't inflate the value.
+        # aux_ah = delta_kWh * 1000 / V_pack_avg.  Use 700V fallback for 608Ah packs, 396V for 300Ah.
         if 'pack_v_mean' in sessions.columns:
             avg_v_kv = sessions['pack_v_mean'].where(sessions['pack_v_mean'] > 100, 700.0) / 1000.0
         else:
