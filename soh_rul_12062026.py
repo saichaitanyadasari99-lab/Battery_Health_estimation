@@ -3187,10 +3187,15 @@ def build_lstm_sequences(soh_series: np.ndarray, lookback: int = 10):
 
 def train_lstm_trajectory(xgb_results: dict, lookback: int = 10) -> dict:
     print("[5/6] Training LSTM trajectory model...")
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense, Dropout
+        from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    except Exception as _tf_err:
+        print(f"  [WARN] TensorFlow unavailable ({_tf_err.__class__.__name__}: {_tf_err}). "
+              f"LSTM skipped — SOH and RUL will use XGBoost-only path.")
+        return {}
     from sklearn.preprocessing import MinMaxScaler
 
     lstm_results = {}
