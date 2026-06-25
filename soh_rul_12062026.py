@@ -149,7 +149,8 @@ CONFIRM_THRESHOLD   = 3.0             # pp — within this of confirmed SOH → 
 # ------------------------------------------------------------------------------
 PROFILE_DEFAULT_NAME = "conservative"
 PROFILE_DEFAULT_PATH = "ev_pipeline_profiles.json"
-STATE_DEFAULT_PATH = "ev_pipeline_state.pkl"
+STATE_DEFAULT_PATH = "ev_pipeline_state.pkl"   # legacy — kept for migration only
+STATE_DIR_NAME     = "states"                   # per-vehicle pkl folder
 INCREMENTAL_OVERLAP_HOURS = 24.0
 
 USER_INPUT_KEYS = (
@@ -344,29 +345,80 @@ def apply_config_profile(profile_name: str = PROFILE_DEFAULT_NAME, profile_path:
 def _resolve_state_path(plot_path: str = None, state_path: str = None) -> Path:
     if state_path:
         return Path(state_path)
-    # Always keep the pkl next to the script regardless of plot_path or cwd.
-    return Path(__file__).resolve().parent / STATE_DEFAULT_PATH
+    return Path(__file__).resolve().parent / STATE_DIR_NAME
 
 
-def _load_pipeline_state(state_path: Path):
-    if not state_path.exists():
+def _load_pipeline_state(state_dir: Path):
+    """Load per-vehicle pkls from states/ and merge into one state dict."""
+    if not state_dir.exists():
         return None
-    try:
-        state = pd.read_pickle(state_path)
-        if isinstance(state, dict):
-            return state
-    except Exception as e:
-        print(f"    [WARN] Could not load state file {state_path}: {e}")
-    return None
+    pkls = sorted(state_dir.glob('*_state.pkl'))
+    if not pkls:
+        return None
+
+    all_sessions, watermarks, init_cap_map, pack_ctx_map = [], {}, {}, {}
+    for pkl_path in pkls:
+        try:
+            v = pd.read_pickle(pkl_path)
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get('vehicle_id', '')).strip()
+            if not vid:
+                continue
+            wm = v.get('last_utc_num', np.nan)
+            watermarks[vid] = float(wm) if (wm is not None and np.isfinite(float(wm))) else np.nan
+            sess = v.get('sessions')
+            if isinstance(sess, pd.DataFrame) and len(sess) > 0:
+                all_sessions.append(sess)
+            ic = v.get('init_capacity_ah', np.nan)
+            if ic and np.isfinite(float(ic)) and float(ic) > 0:
+                init_cap_map[vid] = float(ic)
+            ctx = v.get('pack_context')
+            if isinstance(ctx, dict):
+                pack_ctx_map[vid] = ctx
+        except Exception as e:
+            print(f"    [WARN] Could not load {pkl_path.name}: {e}")
+
+    if not all_sessions and not watermarks:
+        return None
+
+    sessions_df = pd.concat(all_sessions, ignore_index=True, sort=False) if all_sessions else pd.DataFrame()
+    n = len(watermarks)
+    print(f"    Per-vehicle state loaded: {n} vehicle(s), {len(sessions_df):,} sessions")
+    return {
+        'schema_version'   : 2,
+        'sessions'         : sessions_df,
+        'watermarks'       : watermarks,       # {vid: last_utc_num}
+        'init_capacity_map': init_cap_map,
+        'pack_context_map' : pack_ctx_map,
+        # legacy keys — empty so old code paths that check these don't crash
+        'xgb_results': {}, 'lstm_results': {}, 'rul_all': {}, 'replacement_events': pd.DataFrame(),
+    }
 
 
-def _save_pipeline_state(state_path: Path, state: dict):
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.to_pickle(state, state_path)
-        print(f"    State saved -> {state_path}")
-    except Exception as e:
-        print(f"    [WARN] Could not save state file {state_path}: {e}")
+def _save_pipeline_state(state_dir: Path, sessions: pd.DataFrame,
+                          watermarks: dict, init_cap_map: dict, pack_ctx_map: dict):
+    """Save one pkl per vehicle containing only essentials."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if not isinstance(sessions, pd.DataFrame) or 'vehicle_id' not in sessions.columns:
+        return
+    saved = 0
+    for vid, grp in sessions.groupby('vehicle_id', observed=True):
+        vid_str = str(vid)
+        v_state = {
+            'schema_version' : 2,
+            'vehicle_id'     : vid_str,
+            'last_utc_num'   : watermarks.get(vid_str, np.nan),
+            'sessions'       : grp.reset_index(drop=True),
+            'init_capacity_ah': init_cap_map.get(vid_str, np.nan),
+            'pack_context'   : pack_ctx_map.get(vid_str, {}),
+        }
+        try:
+            pd.to_pickle(v_state, state_dir / f"{vid_str}_state.pkl")
+            saved += 1
+        except Exception as e:
+            print(f"    [WARN] Could not save state for {vid_str}: {e}")
+    print(f"    State saved -> {state_dir}/ ({saved} vehicle pkl files)")
 
 
 def _merge_sessions_cached(old_sessions: pd.DataFrame, new_sessions: pd.DataFrame) -> pd.DataFrame:
@@ -813,6 +865,10 @@ def _remap_pipeline_state_vehicle_ids(state: dict, alias_map: dict) -> dict:
             remapped[key] = _remap_vehicle_keyed_dict(remapped[key], alias_map)
     if isinstance(remapped.get('replacement_events'), pd.DataFrame):
         remapped['replacement_events'] = _remap_vehicle_ids_in_frame(remapped['replacement_events'], alias_map)
+    # remap per-vehicle dict keys (watermarks, init_capacity_map, pack_context_map)
+    for key in ['watermarks', 'init_capacity_map', 'pack_context_map']:
+        if isinstance(remapped.get(key), dict):
+            remapped[key] = _remap_vehicle_keyed_dict(remapped[key], alias_map)
     return remapped
 
 
@@ -4538,11 +4594,16 @@ def run_pipeline(
     state = _load_pipeline_state(state_file) if incremental else None
     prev_sessions = None
     since_utc = None
+    watermarks = {}   # per-vehicle: {vid: last_utc_num}
     if state is not None:
         prev_sessions = state.get('sessions')
-        since_utc = state.get('last_utc_num')
+        watermarks    = state.get('watermarks', {})
+        # Global watermark = minimum across vehicles so load_and_clean fetches
+        # enough history for the earliest-updated vehicle.
+        finite_wms = [v for v in watermarks.values() if v is not None and np.isfinite(float(v))]
+        since_utc = float(min(finite_wms)) if finite_wms else None
         n_prev = len(prev_sessions) if isinstance(prev_sessions, pd.DataFrame) else 0
-        print(f"  Incremental state loaded: sessions={n_prev:,}, watermark_utc={since_utc}")
+        print(f"  Per-vehicle state loaded: {len(watermarks)} vehicle(s), {n_prev:,} sessions")
 
     try:
         df_raw = load_and_clean(
@@ -4598,13 +4659,22 @@ def run_pipeline(
     else:
         sessions_new['processing_scope'] = 'unknown'
 
-    if incremental and since_utc is not None and np.isfinite(float(since_utc)):
+    if incremental and watermarks:
         end_utc = _finite_series(sessions_new.get('end_utc', pd.Series(np.nan, index=sessions_new.index)))
-        is_existing = sessions_new['processing_scope'].eq('incremental')
         is_new_vid = sessions_new['processing_scope'].eq('from_start')
-        # Existing vehicles: only new sessions after watermark.
-        # New vehicles: process from start (do not apply global watermark cutoff).
-        new_mask = (is_existing & (end_utc > float(since_utc))) | is_new_vid
+
+        def _after_vehicle_watermark(row_vid, row_end_utc):
+            wm = watermarks.get(str(row_vid))
+            if wm is None or not np.isfinite(float(wm)):
+                return True   # new vehicle — keep all
+            return float(row_end_utc) > float(wm)
+
+        vid_col = sessions_new['vehicle_id'] if 'vehicle_id' in sessions_new.columns else pd.Series('', index=sessions_new.index)
+        keep_inc = pd.Series([
+            _after_vehicle_watermark(v, e)
+            for v, e in zip(vid_col, end_utc)
+        ], index=sessions_new.index)
+        new_mask = keep_inc | is_new_vid
         sessions_new = sessions_new.loc[new_mask].copy()
         n_inc = int((sessions_new['processing_scope'] == 'incremental').sum())
         n_new = int((sessions_new['processing_scope'] == 'from_start').sum())
@@ -4618,12 +4688,18 @@ def run_pipeline(
     if len(sessions) == 0:
         raise RuntimeError("No charging sessions available after incremental merge.")
 
-    cached_xgb = state.get('xgb_results', {}) if isinstance(state, dict) else {}
-    cached_lstm = state.get('lstm_results', {}) if isinstance(state, dict) else {}
-    cached_rul = state.get('rul_all', {}) if isinstance(state, dict) else {}
+    cached_xgb  = state.get('xgb_results', {})        if isinstance(state, dict) else {}
+    cached_lstm = state.get('lstm_results', {})        if isinstance(state, dict) else {}
+    cached_rul  = state.get('rul_all', {})             if isinstance(state, dict) else {}
     cached_repl = state.get('replacement_events', pd.DataFrame()) if isinstance(state, dict) else pd.DataFrame()
-    cached_init_map = _extract_cached_init_capacity_map(cached_rul)
-    cached_pack_ctx = _extract_cached_pack_context_map(cached_rul)
+    # init capacity and pack context come directly from per-vehicle state (schema v2)
+    # Fall back to extracting from rul_all for old single-pkl state (schema v1).
+    if isinstance(state, dict) and state.get('schema_version', 1) >= 2:
+        cached_init_map = state.get('init_capacity_map', {})
+        cached_pack_ctx = state.get('pack_context_map', {})
+    else:
+        cached_init_map = _extract_cached_init_capacity_map(cached_rul)
+        cached_pack_ctx = _extract_cached_pack_context_map(cached_rul)
 
     if incremental and since_utc is not None and len(sessions_new) == 0 and all(
         isinstance(state, dict) and (k in state) for k in ['xgb_results', 'lstm_results', 'rul_all']
@@ -4713,22 +4789,34 @@ def run_pipeline(
     export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
 
     if incremental:
-        last_utc = np.nan
-        if '_utc_num' in df_raw.columns:
-            last_utc = _finite_series(df_raw['_utc_num']).max()
-        if not np.isfinite(last_utc) and since_utc is not None:
-            last_utc = float(since_utc)
-        state_out = {
-            'schema_version': 1,
-            'saved_at_utc': pd.Timestamp.utcnow(),
-            'last_utc_num': float(last_utc) if np.isfinite(last_utc) else since_utc,
-            'sessions': sessions,
-            'xgb_results': _state_safe_xgb_results(xgb_results),
-            'lstm_results': _state_safe_lstm_results(lstm_results),
-            'rul_all': rul_all,
-            'replacement_events': replacement_events,
-        }
-        _save_pipeline_state(state_file, state_out)
+        # Compute per-vehicle watermarks from the raw data max utc.
+        new_watermarks = dict(watermarks)  # carry forward existing
+        if '_utc_num' in df_raw.columns and 'vehicle_id' in df_raw.columns:
+            for vid, grp in df_raw.groupby('vehicle_id', observed=True):
+                vid_str = str(vid)
+                vmax = _finite_series(grp['_utc_num']).max()
+                if np.isfinite(vmax):
+                    prev_wm = new_watermarks.get(vid_str, np.nan)
+                    new_watermarks[vid_str] = float(vmax) if (not np.isfinite(float(prev_wm if prev_wm else np.nan)) or float(vmax) > float(prev_wm)) else float(prev_wm)
+
+        # Extract init capacity and pack context from rul_all results.
+        new_init_map = dict(cached_init_map)
+        new_pack_ctx = dict(cached_pack_ctx)
+        for vid, rr in (rul_all or {}).items():
+            if not isinstance(rr, dict):
+                continue
+            ic = rr.get('q_base_for_soh_ah', rr.get('init_capacity_ah', np.nan))
+            ic = pd.to_numeric(pd.Series([ic]), errors='coerce').iloc[0]
+            if np.isfinite(ic) and ic > 0:
+                new_init_map[str(vid)] = float(ic)
+            ctx = {
+                'pack_config_guess'   : str(rr.get('pack_config_guess', 'unknown')),
+                'pack_score_confidence': float(rr.get('pack_score_confidence', np.nan)),
+                'config_epoch_id'     : int(rr.get('config_epoch_id', 0)),
+            }
+            new_pack_ctx[str(vid)] = ctx
+
+        _save_pipeline_state(state_file, sessions, new_watermarks, new_init_map, new_pack_ctx)
 
     return xgb_results, lstm_results, rul_all
 
