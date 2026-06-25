@@ -4532,7 +4532,10 @@ def export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, s
             'eol_date_p90_ist': r.get('eol_date_p90_ist', pd.NaT),
             'bms_correction_factor': r.get('bms_correction_factor', 1.0),
         })
-    pd.DataFrame(summary_rows).sort_values('vehicle_id').to_csv(out_dir / "fleet_summary.csv", index=False)
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty and 'vehicle_id' in summary_df.columns:
+        summary_df = summary_df.sort_values('vehicle_id')
+    summary_df.to_csv(out_dir / "fleet_summary.csv", index=False)
 
     # 2) Replacement events
     if replacement_events is None:
@@ -4701,16 +4704,9 @@ def run_pipeline(
         cached_init_map = _extract_cached_init_capacity_map(cached_rul)
         cached_pack_ctx = _extract_cached_pack_context_map(cached_rul)
 
-    if incremental and since_utc is not None and len(sessions_new) == 0 and all(
-        isinstance(state, dict) and (k in state) for k in ['xgb_results', 'lstm_results', 'rul_all']
-    ):
-        print("    No new charging sessions after watermark. Reusing cached outputs.")
-        xgb_results = cached_xgb
-        lstm_results = cached_lstm
-        rul_all = cached_rul
-        replacement_events = cached_repl if isinstance(cached_repl, pd.DataFrame) else pd.DataFrame()
-    elif incremental and since_utc is not None and len(sessions_new) == 0:
-        print("    No new charging sessions after watermark; cached models unavailable, running full rebuild.")
+    if incremental and since_utc is not None and len(sessions_new) == 0:
+        # No new sessions — recompute from cached sessions (xgb/rul not stored in pkl).
+        print("    No new charging sessions after watermark. Recomputing from cached sessions.")
         labeled      = compute_soh_labels(sessions, init_capacity_overrides=cached_init_map, prior_pack_context=cached_pack_ctx)
         xgb_results  = train_xgboost_soh(labeled)
         lstm_results = train_lstm_trajectory(xgb_results, lookback=10)
