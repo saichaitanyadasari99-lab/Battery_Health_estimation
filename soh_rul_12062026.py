@@ -2353,12 +2353,8 @@ def load_and_clean(path: str, since_utc: float = None, overlap_sec: float = 0.0)
     # Fall back to chargingCurrent (charger-side; aux subtraction applied later).
     if 'charge_calc' not in df.columns:
         if 'NetBatteryCurrentHiRes' in df.columns:
-            vid = df['vehicle_id'].iloc[0] if 'vehicle_id' in df.columns else '?'
-            print(f"    [DEBUG] {vid}: using NetBatteryCurrentHiRes for charge_calc")
             df['charge_calc'] = (df['NetBatteryCurrentHiRes'].abs() * df['dt_sec']) / 3600.0
         elif 'chargingCurrent' in df.columns:
-            vid = df['vehicle_id'].iloc[0] if 'vehicle_id' in df.columns else '?'
-            print(f"    [DEBUG] {vid}: using chargingCurrent for charge_calc")
             df['charge_calc'] = (df['chargingCurrent'].abs() * df['dt_sec']) / 3600.0
 
     # chg_power_calc: instantaneous charging power (W), only during CHARGING rows
