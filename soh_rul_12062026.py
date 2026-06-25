@@ -2351,11 +2351,11 @@ def load_and_clean(path: str, since_utc: float = None, overlap_sec: float = 0.0)
         )
 
     # charge_calc: Coulomb counting (Ah = |I| * dt / 3600)
-    # Prefer Net_Battery_Current_Hi_Res (BMS terminal current, already net of aux loads).
+    # Prefer NetBatteryCurrentHiRes (BMS terminal current, already net of aux loads).
     # Fall back to chargingCurrent (charger-side; aux subtraction applied later).
     if 'charge_calc' not in df.columns:
-        if 'Net_Battery_Current_Hi_Res' in df.columns:
-            df['charge_calc'] = (df['Net_Battery_Current_Hi_Res'].abs() * df['dt_sec']) / 3600.0
+        if 'NetBatteryCurrentHiRes' in df.columns:
+            df['charge_calc'] = (df['NetBatteryCurrentHiRes'].abs() * df['dt_sec']) / 3600.0
         elif 'chargingCurrent' in df.columns:
             df['charge_calc'] = (df['chargingCurrent'].abs() * df['dt_sec']) / 3600.0
 
@@ -2538,8 +2538,8 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         raise RuntimeError("[CRITICAL] Missing 'bucket' column and no charging rows could be inferred.")
 
     if 'charge_calc' not in chg.columns:
-        if 'Net_Battery_Current_Hi_Res' in chg.columns and 'dt_sec' in chg.columns:
-            chg['charge_calc'] = (chg['Net_Battery_Current_Hi_Res'].abs() * chg['dt_sec']) / 3600.0
+        if 'NetBatteryCurrentHiRes' in chg.columns and 'dt_sec' in chg.columns:
+            chg['charge_calc'] = (chg['NetBatteryCurrentHiRes'].abs() * chg['dt_sec']) / 3600.0
         elif {'chargingCurrent', 'dt_sec'}.issubset(chg.columns):
             chg['charge_calc'] = (chg['chargingCurrent'].abs() * chg['dt_sec']) / 3600.0
 
@@ -2607,10 +2607,10 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
     sessions['duration_min'] = (sessions['end_utc'] - sessions['start_utc']) / 60
 
-    # When Net_Battery_Current_Hi_Res is available it is measured at the battery terminals,
+    # When NetBatteryCurrentHiRes is available it is measured at the battery terminals,
     # so auxiliary loads are already excluded — no aux subtraction needed.
     # For chargingCurrent (charger-side), subtract HVAC/aux loads via hvAuxilaryPowerConsumption.
-    _bms_current_used = 'Net_Battery_Current_Hi_Res' in chg.columns
+    _bms_current_used = 'NetBatteryCurrentHiRes' in chg.columns
     if _bms_current_used:
         sessions['delta_aux_kwh'] = np.nan
         sessions['aux_ah']  = 0.0
