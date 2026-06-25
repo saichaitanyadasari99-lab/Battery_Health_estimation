@@ -2053,7 +2053,7 @@ def _read_csv_resilient(path: Path) -> pd.DataFrame:
         'vehicle_id', 'vehicleId', 'IMEI', 'imei', 'device_imei', 'deviceId', 'device_id', 'vin', 'VIN',
         # Core telemetry/features
         'utc', '_utc_num', 'DateTime',
-        'fuelLevel', 'chargingCurrent', 'battPackVoltage',
+        'fuelLevel', 'chargingCurrent', 'NetBatteryCurrentHiRes', 'battPackVoltage',
         'maxCellVoltage', 'minCellVoltage', 'maxCellTemp', 'minCellTemp',
         'battPowerIn', 'regenerationPower', 'hrlfc', 'totalDistance',
         'hvAuxilaryPowerConsumption',
@@ -2355,8 +2355,12 @@ def load_and_clean(path: str, since_utc: float = None, overlap_sec: float = 0.0)
     # Fall back to chargingCurrent (charger-side; aux subtraction applied later).
     if 'charge_calc' not in df.columns:
         if 'NetBatteryCurrentHiRes' in df.columns:
+            vid = df['vehicle_id'].iloc[0] if 'vehicle_id' in df.columns else '?'
+            print(f"    [DEBUG] {vid}: using NetBatteryCurrentHiRes for charge_calc")
             df['charge_calc'] = (df['NetBatteryCurrentHiRes'].abs() * df['dt_sec']) / 3600.0
         elif 'chargingCurrent' in df.columns:
+            vid = df['vehicle_id'].iloc[0] if 'vehicle_id' in df.columns else '?'
+            print(f"    [DEBUG] {vid}: using chargingCurrent for charge_calc")
             df['charge_calc'] = (df['chargingCurrent'].abs() * df['dt_sec']) / 3600.0
 
     # chg_power_calc: instantaneous charging power (W), only during CHARGING rows
@@ -4742,17 +4746,17 @@ if __name__ == '__main__':
     DEFAULT_DATA_PATH = str(script_dir / "data")
 
     data_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATA_PATH
-    if len(sys.argv) > 2:
+    if len(sys.argv) > 2 and sys.argv[2].strip():
         plot_path = sys.argv[2]
     else:
         plot_path = str(script_dir / "soh_rul_results.png")
 
     profile_name = PROFILE_DEFAULT_NAME
     profile_path = None
-    arg3 = sys.argv[3] if len(sys.argv) > 3 else None
-    arg4 = sys.argv[4] if len(sys.argv) > 4 else None
-    arg5 = sys.argv[5] if len(sys.argv) > 5 else None
-    arg6 = sys.argv[6] if len(sys.argv) > 6 else None
+    arg3 = (sys.argv[3].strip() or None) if len(sys.argv) > 3 else None
+    arg4 = (sys.argv[4].strip() or None) if len(sys.argv) > 4 else None
+    arg5 = (sys.argv[5].strip() or None) if len(sys.argv) > 5 else None
+    arg6 = (sys.argv[6].strip() or None) if len(sys.argv) > 6 else None
 
     if arg3:
         if str(arg3).lower().endswith('.json'):
