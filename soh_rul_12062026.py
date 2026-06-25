@@ -2585,6 +2585,7 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         'bms_soh'          : ('bms_soh',             'mean'),
         'bms_init_cap'     : ('bms_init_cap',        'mean'),
         'delta_aux_kwh'    : ('hvAuxilaryPowerConsumption', _aux_kwh_delta),
+        'max_dt_sec'       : ('dt_sec',                      'max'),
     }
     for key, (col, func) in optional.items():
         if col in chg.columns:
@@ -2642,6 +2643,16 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
         ah_for_q / (sessions['delta_soc_pct'] / 100.0),
         np.nan
     )
+
+    # 90% gap filter: if a single telemetry gap spans ≥90% of the session time
+    # window, we cannot verify charging continuity — the Coulomb count may be
+    # wildly wrong. Null implied_Q_Ah for such sessions so they are excluded
+    # from the rolling capacity median (and thus from SOH labels). The session
+    # row is still written to session_predictions.csv for visibility.
+    if 'max_dt_sec' in sessions.columns:
+        _session_span = (sessions['end_utc'] - sessions['start_utc']).replace(0, np.nan)
+        sessions['gap_frac'] = sessions['max_dt_sec'] / _session_span
+        sessions.loc[sessions['gap_frac'] >= 0.90, 'implied_Q_Ah'] = np.nan
 
     # Health indicators (only if source columns available)
     if 'wh_total' in sessions.columns and 'ah_total' in sessions.columns:
