@@ -344,9 +344,7 @@ def apply_config_profile(profile_name: str = PROFILE_DEFAULT_NAME, profile_path:
 def _resolve_state_path(plot_path: str = None, state_path: str = None) -> Path:
     if state_path:
         return Path(state_path)
-    if plot_path:
-        p = Path(plot_path)
-        return p.parent / STATE_DEFAULT_PATH
+    # Always keep the pkl next to the script regardless of plot_path or cwd.
     return Path(__file__).resolve().parent / STATE_DEFAULT_PATH
 
 
@@ -4432,8 +4430,9 @@ def export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, s
     """
     Export final outputs to CSV files.
     """
-    out_root = Path(save_path)
-    out_dir = out_root.parent / f"{out_root.stem}_exports"
+    # Always write to a fixed folder next to the script so reruns
+    # append/overwrite the same files regardless of cwd or plot_path.
+    out_dir = Path(__file__).resolve().parent / "soh_rul_results_exports"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Fleet summary
