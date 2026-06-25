@@ -4788,7 +4788,8 @@ def run_pipeline(
     plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
     export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
 
-    if incremental:
+    # Always save state (full or inc) so the next inc run has correct sessions.
+    if True:
         # Compute per-vehicle watermarks from the raw data max utc.
         new_watermarks = dict(watermarks)  # carry forward existing
         if '_utc_num' in df_raw.columns and 'vehicle_id' in df_raw.columns:
