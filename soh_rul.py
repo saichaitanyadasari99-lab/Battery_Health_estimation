@@ -3363,7 +3363,7 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     Sqrt degradation model: SOH(t) = S0 - alpha * sqrt(t - t0)
     Physics: LFP SEI growth is diffusion-limited => capacity fade proportional to sqrt(time).
     Fixes applied:
-      A) 3-session rolling median pre-smoothing to suppress single-session noise
+      A) Backward 10-session rolling mean to suppress session-to-session noise
       B) Guard 3: alpha credibility check vs lifetime-observed rate
       C) Floor branch uses linear rate formula (not quadratic sqrt formula)
       D) Hard cap on all RUL outputs at RUL_MAX_MONTHS
@@ -3403,7 +3403,21 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     n         = len(hrlfc_seq)
     hrlfc_now = float(hrlfc_seq[-1])
     t0        = float(hrlfc_seq[0])
-    soh_now   = float(soh_seq[-1])
+
+    # Fix A: backward 10-session rolling mean — each point is the mean of the
+    # preceding 10 sessions (min 5). A single noisy session contributes only 10%
+    # of the window weight. Applied everywhere including soh_now.
+    if n >= 15:
+        smoothed = pd.Series(soh_seq).rolling(10, min_periods=5).mean().values
+        # Drop leading NaNs (first 4 sessions before window fills)
+        valid_sm = np.isfinite(smoothed)
+        if valid_sm.sum() >= 5:
+            hrlfc_seq = hrlfc_seq[valid_sm]
+            soh_seq   = smoothed[valid_sm]
+            n         = len(hrlfc_seq)
+            hrlfc_now = float(hrlfc_seq[-1])
+
+    soh_now = float(soh_seq[-1])
 
     # Initial SOH from first 10% of sessions
     _n_init = max(3, min(20, n // 10))
