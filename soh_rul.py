@@ -3403,12 +3403,7 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     n         = len(hrlfc_seq)
     hrlfc_now = float(hrlfc_seq[-1])
     t0        = float(hrlfc_seq[0])
-
-    # Fix A: pre-smooth SOH with 3-session rolling median to suppress single-session noise spikes
-    if n >= 9:
-        soh_seq = pd.Series(soh_seq).rolling(3, center=True, min_periods=1).median().values
-
-    soh_now = float(soh_seq[-1])
+    soh_now   = float(soh_seq[-1])
 
     # Initial SOH from first 10% of sessions
     _n_init = max(3, min(20, n // 10))
