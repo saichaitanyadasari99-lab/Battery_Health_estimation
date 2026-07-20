@@ -133,6 +133,9 @@ RUL_MIN_DATA_SPAN_DAYS      = 120.0   # Need ≥ 4 months of session history for
                                        # vehicles below this threshold fall through to floor rate
 RUL_MAX_SLOPE_PCT_PER_YEAR  = 20.0    # Hard cap: if implied degradation > 20%/yr, clamp to 20%/yr.
                                        # Real-world EV fleet max is ~8-10%/yr; 20% gives headroom.
+RUL_MIN_SESSIONS_OVERRIDE   = 150     # Bypass 120-day span guard if vehicle has ≥ 150 sessions
+RUL_MAX_MONTHS              = 60      # Hard cap: don't extrapolate beyond 5 years
+RUL_ALPHA_CREDIBILITY_MULT  = 2.0     # Fitted alpha ≤ 2× lifetime-observed alpha (noise guard)
 RECENT_KM_WINDOW_DAYS       = 60      # Window for recent km/day estimate
 TOTAL_DISTANCE_MAX_KM       = 500_000.0  # Fault-code filter: INT32_MAX/100 ≈ 21,474,836 is a known
                                           # telematics overflow sentinel; any value above 500k km is
@@ -3356,193 +3359,202 @@ def train_lstm_trajectory(xgb_results: dict, lookback: int = 10) -> dict:
 # ------------------------------------------------------------------------------
 def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
                     eol=SOH_EOL) -> dict:
+    """
+    Sqrt degradation model: SOH(t) = S0 - alpha * sqrt(t - t0)
+    Physics: LFP SEI growth is diffusion-limited => capacity fade proportional to sqrt(time).
+    Fixes applied:
+      A) 3-session rolling median pre-smoothing to suppress single-session noise
+      B) Guard 3: alpha credibility check vs lifetime-observed rate
+      C) Floor branch uses linear rate formula (not quadratic sqrt formula)
+      D) Hard cap on all RUL outputs at RUL_MAX_MONTHS
+    """
     hrlfc_seq = np.array(hrlfc_seq, dtype=float)
     soh_seq   = np.array(soh_seq,   dtype=float)
 
-    finite = np.isfinite(hrlfc_seq) & np.isfinite(soh_seq)
+    finite    = np.isfinite(hrlfc_seq) & np.isfinite(soh_seq)
     hrlfc_seq = hrlfc_seq[finite]
     soh_seq   = soh_seq[finite]
 
-    _nan_result = {
-        'phase2_slope'  : 0.0,
-        'soh_now'       : soh_seq[-1] if len(soh_seq) else np.nan,
-        'hrlfc_now'     : hrlfc_seq[-1] if len(hrlfc_seq) else np.nan,
-        'rul_hrlfc_p10' : np.nan, 'rul_hrlfc_p50' : np.nan, 'rul_hrlfc_p90' : np.nan,
-        'rul_days_p10'  : np.nan, 'rul_days_p50'  : np.nan, 'rul_days_p90'  : np.nan,
-        'slope_basis'   : 'insufficient_data',
+    _make_nan = lambda sn, hn: {
+        'phase2_slope': 0.0, 'slope_se': np.nan, 'sqrt_alpha': 0.0,
+        'soh_initial': np.nan, 'soh_now': sn, 'hrlfc_now': hn,
+        'rul_hrlfc_p10': np.nan, 'rul_hrlfc_p50': np.nan, 'rul_hrlfc_p90': np.nan,
+        'rul_days_p10':  np.nan, 'rul_days_p50':  np.nan, 'rul_days_p90':  np.nan,
+        'slope_basis': 'insufficient_data',
     }
-    if len(hrlfc_seq) < 4:
-        return _nan_result
 
-    order = np.argsort(hrlfc_seq)
+    if len(hrlfc_seq) < 4:
+        return _make_nan(
+            soh_seq[-1]   if len(soh_seq)   else np.nan,
+            hrlfc_seq[-1] if len(hrlfc_seq) else np.nan,
+        )
+
+    order     = np.argsort(hrlfc_seq)
     hrlfc_seq = hrlfc_seq[order]
     soh_seq   = soh_seq[order]
 
-    dedup = (
-        pd.DataFrame({'x': hrlfc_seq, 'y': soh_seq})
-        .groupby('x', as_index=False)['y'].median()
-    )
+    dedup     = pd.DataFrame({'x': hrlfc_seq, 'y': soh_seq}).groupby('x', as_index=False)['y'].median()
     hrlfc_seq = dedup['x'].values
     soh_seq   = dedup['y'].values
 
-    if len(hrlfc_seq) < 3:
-        _nan_result['soh_now']   = soh_seq[-1]
-        _nan_result['hrlfc_now'] = hrlfc_seq[-1]
-        return _nan_result
-
-    if (not np.isfinite(hrlfc_to_days)) or (hrlfc_to_days <= 0):
+    if not np.isfinite(hrlfc_to_days) or hrlfc_to_days <= 0:
         hrlfc_to_days = 0.07
 
-    soh_now   = float(soh_seq[-1])
+    n         = len(hrlfc_seq)
     hrlfc_now = float(hrlfc_seq[-1])
+    t0        = float(hrlfc_seq[0])
 
-    # --- Recency-weighted tail window ---
-    n      = len(hrlfc_seq)
-    tail_n = min(n, max(RUL_TAIL_MIN_SESSIONS, int(np.ceil(RUL_TAIL_FRACTION * n))))
-    x_tail = hrlfc_seq[-tail_n:]
-    y_tail = soh_seq[-tail_n:]
+    # Fix A: pre-smooth SOH with 3-session rolling median to suppress single-session noise spikes
+    if n >= 9:
+        soh_seq = pd.Series(soh_seq).rolling(3, center=True, min_periods=1).median().values
 
-    if tail_n > 1:
-        ranks  = np.arange(tail_n, dtype=float)
-        w_tail = np.exp(RUL_RECENCY_WEIGHT_K * (ranks / (tail_n - 1) - 1.0))
-    else:
-        w_tail = np.ones(1)
+    soh_now = float(soh_seq[-1])
 
-    # Weighted least squares: solve (W^0.5 X) b = W^0.5 y
-    X_mat  = np.column_stack([x_tail, np.ones(tail_n)])
-    W_sqrt = np.sqrt(w_tail)
-    Xw     = X_mat  * W_sqrt[:, None]
-    yw     = y_tail * W_sqrt
-    coeffs, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
-    slope     = float(coeffs[0])
-    intercept = float(coeffs[1])
+    # Initial SOH from first 10% of sessions
+    _n_init = max(3, min(20, n // 10))
+    S0      = float(np.nanmedian(soh_seq[:_n_init]))
 
-    # Standard error of slope from WLS residuals
-    y_hat        = slope * x_tail + intercept
-    residuals    = y_tail - y_hat
-    w_sum        = float(np.sum(w_tail))
-    weighted_sse = float(np.sum(w_tail * residuals ** 2))
-    x_w_mean     = float(np.sum(w_tail * x_tail) / w_sum)
-    weighted_ssx = float(np.sum(w_tail * (x_tail - x_w_mean) ** 2))
-    dof          = max(tail_n - 2, 1)
-    slope_se     = float(np.sqrt(weighted_sse / dof / max(weighted_ssx, 1e-12)))
-    slope_se     = max(slope_se, abs(slope) * 0.20)   # at least 20% of slope magnitude (model + future uncertainty)
+    data_span_days = (hrlfc_seq[-1] - t0) * hrlfc_to_days
+    hrlfc_per_year = 365.0 / hrlfc_to_days
 
-    # --- Guard 1: insufficient data span → force floor rate ---
-    # WLS slope over < 4 months of data is dominated by session noise, not real degradation.
-    data_span_days = (hrlfc_seq[-1] - hrlfc_seq[0]) * hrlfc_to_days
+    # Fit: y = alpha * x  where x = sqrt(t - t0),  y = S0 - SOH
+    # Recency-weighted WLS through origin across ALL sessions.
+    t_rel   = hrlfc_seq - t0
+    x_fit   = np.sqrt(np.maximum(t_rel, 0.0))
+    y_fit   = S0 - soh_seq
+    ranks   = np.arange(n, dtype=float)
+    weights = np.exp(RUL_RECENCY_WEIGHT_K * (ranks / max(n - 1, 1) - 1.0))
+
+    valid = (x_fit > 0) & (y_fit > -2.0)
+    if valid.sum() < 3:
+        return _make_nan(soh_now, hrlfc_now)
+
+    xv, yv, wv = x_fit[valid], y_fit[valid], weights[valid]
+    alpha       = float(np.sum(wv * xv * yv) / max(np.sum(wv * xv ** 2), 1e-12))
+
+    y_hat_v      = alpha * xv
+    residuals    = yv - y_hat_v
+    weighted_sse = float(np.sum(wv * residuals ** 2))
+    weighted_ssx = float(np.sum(wv * xv ** 2))
+    dof          = max(int(valid.sum()) - 1, 1)
+    alpha_se     = float(np.sqrt(weighted_sse / dof / max(weighted_ssx, 1e-12)))
+    alpha_se     = max(alpha_se, abs(alpha) * 0.20)
+
+    _n10       = max(3, n // 10)
+    _s_e       = float(np.nanmedian(soh_seq[:_n10]))
+    _s_l       = float(np.nanmedian(soh_seq[-_n10:]))
+    _x_e       = float(np.nanmedian(x_fit[:_n10]))
+    _x_l       = float(np.nanmedian(x_fit[-_n10:]))
+    _life_drop = _s_e - _s_l
+    _x_span    = max(_x_l - _x_e, 1e-12)
+
+    # Guard 1: insufficient data — neither span nor session count is enough
     if np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
-        slope = 0.0   # triggers floor-rate branch below
+        if n < RUL_MIN_SESSIONS_OVERRIDE:
+            alpha = 0.0
 
-    # --- Guard 2: annualised slope sanity cap ---
-    # If implied degradation > RUL_MAX_SLOPE_PCT_PER_YEAR (%/yr), clamp.
-    # This catches cases where a short noisy tail produces a wildly steep slope.
-    if slope < RUL_MIN_NEG_SLOPE and hrlfc_to_days > 0:
-        slope_pct_per_year = slope / hrlfc_to_days * 365.0
-        if slope_pct_per_year < -RUL_MAX_SLOPE_PCT_PER_YEAR:
-            slope = (-RUL_MAX_SLOPE_PCT_PER_YEAR / 365.0) * hrlfc_to_days
-            slope_se = abs(slope) * 0.10   # widen SE after clamping
+    # Guard 2: physical alpha cap
+    if alpha > 0 and np.isfinite(hrlfc_per_year):
+        alpha_max = 2.0 * RUL_MAX_SLOPE_PCT_PER_YEAR / np.sqrt(hrlfc_per_year)
+        if alpha > alpha_max:
+            alpha    = alpha_max
+            alpha_se = abs(alpha) * 0.10
 
-    # --- Floor degradation rate (conservative estimate for flat/new vehicles) ---
-    hrlfc_per_year = (365.0 / hrlfc_to_days) if hrlfc_to_days > 0 else np.nan
-    floor_slope = (-(RUL_FLOOR_PCT_PER_YEAR / hrlfc_per_year)
-                   if np.isfinite(hrlfc_per_year) else np.nan)
+    # Fix B — Guard 3: clamp alpha if it exceeds credibility multiple of lifetime-observed rate
+    if alpha > 0 and _life_drop > 0:
+        life_alpha = _life_drop / _x_span
+        if alpha > RUL_ALPHA_CREDIBILITY_MULT * life_alpha:
+            alpha    = RUL_ALPHA_CREDIBILITY_MULT * life_alpha
+            alpha_se = abs(alpha) * 0.30
 
-    # --- Lifetime slope fallback for floor rate ---
-    # If the vehicle has historically degraded > 2% (first vs last decile of soh_xgb)
-    # but the WLS tail is flat, use half the lifetime degradation rate as the floor.
-    # This prevents vehicles at e.g. 85% SOH from showing "Beyond 5y" just because
-    # their recent 50-session window is noisy/stable.
-    _n10    = max(3, len(soh_seq) // 10)
-    _s_early = float(np.nanmedian(soh_seq[:_n10]))
-    _s_late  = float(np.nanmedian(soh_seq[-_n10:]))
-    _h_early = float(np.nanmedian(hrlfc_seq[:_n10]))
-    _h_late  = float(np.nanmedian(hrlfc_seq[-_n10:]))
-    _life_drop = _s_early - _s_late
-    _life_span = _h_late - _h_early
-    if _life_drop > 2.0 and _life_span > 0 and data_span_days > 30:
-        _life_floor = -(_life_drop / _life_span) * 0.5   # half rate: future tends to slow
-        if np.isfinite(floor_slope) and _life_floor < floor_slope:
-            floor_slope = _life_floor
+    # Tangent slope at hrlfc_now for backward-compatible phase2_slope
+    t_now_rel     = max(hrlfc_now - t0, 1.0)
+    tangent_slope = -(alpha / (2.0 * np.sqrt(t_now_rel)))
 
-    # --- RUL via slope sampling ---
-    if slope < RUL_MIN_NEG_SLOPE:
-        slope_basis   = 'wls_tail_recency'
-        slope_samples = np.random.normal(slope, slope_se, RUL_SLOPE_SAMPLES)
-        rul_samples   = []
-        for s in slope_samples:
-            if s < RUL_MIN_NEG_SLOPE:
-                rul_h = max(0.0, (eol - intercept) / s - hrlfc_now)
-                if np.isfinite(rul_h):
-                    rul_samples.append(rul_h)
+    soh_remaining = max(S0 - eol, 0.0)
+
+    # Fix D: hard cap helper — 60 months max on any RUL days value
+    _rul_max_days = RUL_MAX_MONTHS * 30.4375
+    _cap = lambda d: min(d, _rul_max_days) if np.isfinite(d) else d
+
+    def _rul_from_alpha(a):
+        if a <= 0 or soh_remaining <= 0:
+            return None
+        t_eol = (soh_remaining / a) ** 2
+        r = t_eol - (hrlfc_now - t0)
+        return max(0.0, r) if np.isfinite(r) else None
+
+    # RUL via alpha sampling
+    if alpha > 0:
+        samples     = np.random.normal(alpha, alpha_se, RUL_SLOPE_SAMPLES)
+        rul_samples = [r for a in samples for r in [_rul_from_alpha(a)] if r is not None]
 
         if rul_samples:
             rul_arr = np.array(rul_samples)
             return {
-                'phase2_slope'  : slope,
-                'slope_se'      : slope_se,
+                'phase2_slope'  : tangent_slope,
+                'slope_se'      : alpha_se,
+                'sqrt_alpha'    : alpha,
+                'soh_initial'   : S0,
                 'soh_now'       : soh_now,
                 'hrlfc_now'     : hrlfc_now,
                 'rul_hrlfc_p10' : float(np.percentile(rul_arr, 10)),
                 'rul_hrlfc_p50' : float(np.percentile(rul_arr, 50)),
                 'rul_hrlfc_p90' : float(np.percentile(rul_arr, 90)),
-                'rul_days_p10'  : float(np.percentile(rul_arr, 10)) * hrlfc_to_days,
-                'rul_days_p50'  : float(np.percentile(rul_arr, 50)) * hrlfc_to_days,
-                'rul_days_p90'  : float(np.percentile(rul_arr, 90)) * hrlfc_to_days,
-                'slope_basis'   : slope_basis,
+                'rul_days_p10'  : _cap(float(np.percentile(rul_arr, 10)) * hrlfc_to_days),
+                'rul_days_p50'  : _cap(float(np.percentile(rul_arr, 50)) * hrlfc_to_days),
+                'rul_days_p90'  : _cap(float(np.percentile(rul_arr, 90)) * hrlfc_to_days),
+                'slope_basis'   : 'sqrt_degradation_model',
             }
-        # Slope sampling produced no valid RUL; fall through to deterministic
-        rul_det = max(0.0, (eol - intercept) / slope - hrlfc_now)
+
+        rul_det = _rul_from_alpha(alpha) or 0.0
         return {
-            'phase2_slope'  : slope,
-            'slope_se'      : slope_se,
-            'soh_now'       : soh_now,
-            'hrlfc_now'     : hrlfc_now,
-            'rul_hrlfc_p10' : rul_det, 'rul_hrlfc_p50' : rul_det, 'rul_hrlfc_p90' : rul_det,
-            'rul_days_p10'  : rul_det * hrlfc_to_days,
-            'rul_days_p50'  : rul_det * hrlfc_to_days,
-            'rul_days_p90'  : rul_det * hrlfc_to_days,
-            'slope_basis'   : slope_basis + '_det_fallback',
+            'phase2_slope'  : tangent_slope, 'slope_se': alpha_se,
+            'sqrt_alpha'    : alpha, 'soh_initial': S0,
+            'soh_now'       : soh_now, 'hrlfc_now': hrlfc_now,
+            'rul_hrlfc_p10' : rul_det, 'rul_hrlfc_p50': rul_det, 'rul_hrlfc_p90': rul_det,
+            'rul_days_p10'  : _cap(rul_det * hrlfc_to_days),
+            'rul_days_p50'  : _cap(rul_det * hrlfc_to_days),
+            'rul_days_p90'  : _cap(rul_det * hrlfc_to_days),
+            'slope_basis'   : 'sqrt_degradation_model_det_fallback',
         }
 
-    # No degradation detected in tail (or guards zeroed the slope) —
-    # use floor rate for a conservative upper-bound estimate.
-    if np.isfinite(floor_slope) and soh_now > eol:
-        rul_floor_h   = max(0.0, (eol - soh_now) / floor_slope)
-        rul_floor_d   = rul_floor_h * hrlfc_to_days
+    # Fix C — floor branch: linear rate formula (not quadratic sqrt formula)
+    # soh_remaining / (floor_rate_pct/day) gives days to EOL at constant floor rate
+    if soh_now > eol:
+        _floor_rate_per_day = RUL_FLOOR_PCT_PER_YEAR / 365.0
+        rul_floor_d = _cap((soh_now - eol) / _floor_rate_per_day)
+        rul_floor_h = rul_floor_d / hrlfc_to_days
         if np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
             floor_basis = 'floor_rate_insufficient_data'
-        elif _life_drop > 2.0 and np.isfinite(floor_slope) and floor_slope != -(RUL_FLOOR_PCT_PER_YEAR / hrlfc_per_year):
+        elif _life_drop > 2.0:
             floor_basis = 'floor_rate_lifetime_slope'
         else:
             floor_basis = 'floor_rate_no_degradation'
         return {
-            'phase2_slope'  : slope,
-            'slope_se'      : slope_se,
-            'soh_now'       : soh_now,
-            'hrlfc_now'     : hrlfc_now,
+            'phase2_slope'  : tangent_slope, 'slope_se': alpha_se,
+            'sqrt_alpha'    : 0.0, 'soh_initial': S0,
+            'soh_now'       : soh_now, 'hrlfc_now': hrlfc_now,
             'rul_hrlfc_p10' : np.nan,
             'rul_hrlfc_p50' : rul_floor_h,
-            'rul_hrlfc_p90' : rul_floor_h * 2.0,   # best-case: half the floor rate
+            'rul_hrlfc_p90' : rul_floor_h * 2.0,
             'rul_days_p10'  : np.nan,
             'rul_days_p50'  : rul_floor_d,
-            'rul_days_p90'  : rul_floor_d * 2.0,
+            'rul_days_p90'  : _cap(rul_floor_d * 2.0),
             'slope_basis'   : floor_basis,
         }
 
-    # SOH already at or below EOL
     if soh_now <= eol:
         return {
-            'phase2_slope'  : slope,
-            'slope_se'      : slope_se,
-            'soh_now'       : soh_now,
-            'hrlfc_now'     : hrlfc_now,
-            'rul_hrlfc_p10' : 0.0, 'rul_hrlfc_p50' : 0.0, 'rul_hrlfc_p90' : 0.0,
-            'rul_days_p10'  : 0.0, 'rul_days_p50'  : 0.0, 'rul_days_p90'  : 0.0,
+            'phase2_slope'  : tangent_slope, 'slope_se': np.nan,
+            'sqrt_alpha'    : 0.0, 'soh_initial': S0,
+            'soh_now'       : soh_now, 'hrlfc_now': hrlfc_now,
+            'rul_hrlfc_p10' : 0.0, 'rul_hrlfc_p50': 0.0, 'rul_hrlfc_p90': 0.0,
+            'rul_days_p10'  : 0.0, 'rul_days_p50':  0.0, 'rul_days_p90':  0.0,
             'slope_basis'   : 'already_at_eol',
         }
 
-    return _nan_result
+    return _make_nan(soh_now, hrlfc_now)
 
 def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None) -> dict:
     print("[6/6] Computing RUL...")
