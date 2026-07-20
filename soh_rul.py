@@ -3461,7 +3461,8 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
             alpha_se = abs(alpha) * 0.10
 
     # Fix B — Guard 3: clamp alpha if it exceeds credibility multiple of lifetime-observed rate
-    if alpha > 0 and _life_drop > 0:
+    # Only apply when _life_drop > 1% — below that, life_alpha is too noisy to be a reliable bound
+    if alpha > 0 and _life_drop > 1.0:
         life_alpha = _life_drop / _x_span
         if alpha > RUL_ALPHA_CREDIBILITY_MULT * life_alpha:
             alpha    = RUL_ALPHA_CREDIBILITY_MULT * life_alpha
