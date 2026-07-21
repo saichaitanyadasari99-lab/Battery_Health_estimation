@@ -3602,7 +3602,8 @@ def _detect_soh_jump_epoch(soh_seq: np.ndarray, min_jump_pp: float = 12.0,
     return last_epoch_start
 
 
-def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None) -> dict:
+def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None,
+                    replacement_events: pd.DataFrame = None) -> dict:
     print("[6/6] Computing RUL...")
     rul_all = {}
 
@@ -3710,28 +3711,36 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             soh_col   = 'soh_xgb' if 'soh_xgb' in g.columns else 'soh_display'
             soh_seq   = _finite_series(g[soh_col]).values
 
-        # Detect pack replacement by upward SOH jump when BMS counter did not reset.
-        # Use soh_label (raw energy-based SOH) — XGBoost/LSTM predictions are smooth
-        # functions of HRLFC and hide the jump. soh_label shows the true per-session jump.
-        # Old-pack sessions would corrupt S0 and the sqrt slope if included — clip them out.
-        for _det_col in ('soh_label', 'soh_xgb'):
-            if _det_col in g.columns:
-                _det_seq = _finite_series(g[_det_col]).values.astype(float)
-                break
-        else:
-            _det_seq = soh_seq
-        _epoch_in_g  = _detect_soh_jump_epoch(_det_seq)
+        # Detect pack replacement — use authoritative replacement_events table (already
+        # filtered to conf >= 0.95 and SOH jump >= 5pp) so no threshold re-tuning needed.
+        # Fall back to soh_label rolling-median detection only if table is unavailable.
+        _epoch_in_g = None
+        _repl_source = None
+        if replacement_events is not None and not replacement_events.empty:
+            _rv = replacement_events[replacement_events['vehicle_id'] == vid]
+            if not _rv.empty:
+                # Use the highest-confidence event; ties broken by largest SOH jump
+                _rv = _rv.sort_values(['confidence', 'soh_jump_pct'], ascending=False)
+                _best = _rv.iloc[0]
+                _epoch_in_g  = int(_best['event_session_idx'])
+                _repl_source = f"replacement_events (conf={_best['confidence']:.2f}, jump={_best['soh_jump_pct']:.1f}pp)"
+        if _epoch_in_g is None:
+            for _det_col in ('soh_label', 'soh_xgb'):
+                if _det_col in g.columns:
+                    _det_seq = _finite_series(g[_det_col]).values.astype(float)
+                    break
+            else:
+                _det_seq = soh_seq
+            _epoch_in_g  = _detect_soh_jump_epoch(_det_seq)
+            _repl_source = _det_col if _epoch_in_g is not None else None
+
         if _epoch_in_g is not None:
             _lb_offset       = lstm_results[vid]['lookback'] if vid in lstm_results else 0
             _soh_epoch_start = max(0, _epoch_in_g - _lb_offset)
             if _soh_epoch_start < len(soh_seq) - 5:
-                _post_n   = len(soh_seq) - _soh_epoch_start
-                _win      = min(10, max(1, _post_n))
-                _pre_med  = float(np.nanmedian(_det_seq[max(0, _epoch_in_g - 10):_epoch_in_g]))
-                _post_med = float(np.nanmedian(_det_seq[_epoch_in_g:_epoch_in_g + _win]))
-                print(f"    [SOH-Jump] {vid}: replacement — SOH {_pre_med:.1f}% → {_post_med:.1f}% "
-                      f"at session {_epoch_in_g} (from {_det_col}). RUL using post-replacement epoch "
-                      f"({_post_n} sessions).")
+                _post_n = len(soh_seq) - _soh_epoch_start
+                print(f"    [SOH-Jump] {vid}: pack replacement at session {_epoch_in_g} "
+                      f"via {_repl_source}. RUL using post-replacement epoch ({_post_n} sessions).")
                 hrlfc_seq = hrlfc_seq[_soh_epoch_start:] - hrlfc_seq[_soh_epoch_start]
                 soh_seq   = soh_seq[_soh_epoch_start:]
 
@@ -4791,10 +4800,12 @@ def run_pipeline(
         # No new sessions — recompute from cached sessions (xgb/rul not stored in pkl).
         print("    No new charging sessions after watermark. Recomputing from cached sessions.")
         labeled      = compute_soh_labels(sessions, init_capacity_overrides=cached_init_map, prior_pack_context=cached_pack_ctx)
-        xgb_results  = train_xgboost_soh(labeled)
-        lstm_results = train_lstm_trajectory(xgb_results, lookback=10)
-        rul_all      = compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all=cached_rul)
+        xgb_results        = train_xgboost_soh(labeled)
+        lstm_results       = train_lstm_trajectory(xgb_results, lookback=10)
         replacement_events = detect_battery_replacements(xgb_results)
+        rul_all            = compute_all_rul(xgb_results, lstm_results, df_raw,
+                                             prev_rul_all=cached_rul,
+                                             replacement_events=replacement_events)
 
     elif incremental and since_utc is not None and len(sessions_new) > 0:
         touched = set(sessions_new['vehicle_id'].dropna().tolist()) if 'vehicle_id' in sessions_new.columns else set()
@@ -4828,11 +4839,13 @@ def run_pipeline(
                 else:
                     raise
             else:
-                xgb_new = train_xgboost_soh(labeled_new)
-                lstm_new = train_lstm_trajectory(xgb_new, lookback=10)
+                xgb_new      = train_xgboost_soh(labeled_new)
+                lstm_new     = train_lstm_trajectory(xgb_new, lookback=10)
+                repl_new     = detect_battery_replacements(xgb_new)
                 prev_rul_touched = {v: cached_rul.get(v, {}) for v in touched if v in cached_rul}
-                rul_new = compute_all_rul(xgb_new, lstm_new, df_raw, prev_rul_all=prev_rul_touched)
-                repl_new = detect_battery_replacements(xgb_new)
+                rul_new      = compute_all_rul(xgb_new, lstm_new, df_raw,
+                                               prev_rul_all=prev_rul_touched,
+                                               replacement_events=repl_new)
 
                 xgb_results = dict(cached_xgb)
                 xgb_results.update(xgb_new)
@@ -4857,10 +4870,12 @@ def run_pipeline(
             init_capacity_overrides=cached_init_map if incremental else None,
             prior_pack_context=cached_pack_ctx if incremental else None,
         )
-        xgb_results  = train_xgboost_soh(labeled)
-        lstm_results = train_lstm_trajectory(xgb_results, lookback=10)
-        rul_all      = compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all=cached_rul if incremental else None)
+        xgb_results        = train_xgboost_soh(labeled)
+        lstm_results       = train_lstm_trajectory(xgb_results, lookback=10)
         replacement_events = detect_battery_replacements(xgb_results)
+        rul_all            = compute_all_rul(xgb_results, lstm_results, df_raw,
+                                             prev_rul_all=cached_rul if incremental else None,
+                                             replacement_events=replacement_events)
 
     _print_summary_tables(rul_all, replacement_events)
     plot_results(xgb_results, lstm_results, rul_all, plot_path)
