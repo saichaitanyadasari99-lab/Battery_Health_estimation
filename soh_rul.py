@@ -61,7 +61,7 @@ SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
 EXPECTED_CAPACITY_OPTIONS_AH = (104.5, 153.0, 306.0, 612.0)  # Fleet pack capacities
-REPORT_RUL_CAP_DAYS = 1825.0          # RUL reporting horizon cap (days)
+REPORT_RUL_CAP_DAYS = 2922.0          # RUL reporting horizon cap (days) — 96 months
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
 VEHICLE_ID_MODE = "latest_device_per_file"  # auto | latest_device_per_file
@@ -134,7 +134,7 @@ RUL_MIN_DATA_SPAN_DAYS      = 120.0   # Need ≥ 4 months of session history for
 RUL_MAX_SLOPE_PCT_PER_YEAR  = 20.0    # Hard cap: if implied degradation > 20%/yr, clamp to 20%/yr.
                                        # Real-world EV fleet max is ~8-10%/yr; 20% gives headroom.
 RUL_MIN_SESSIONS_OVERRIDE   = 150     # Bypass 120-day span guard if vehicle has ≥ 150 sessions
-RUL_MAX_MONTHS              = 60      # Hard cap: don't extrapolate beyond 5 years
+RUL_MAX_MONTHS              = 96      # Hard cap: don't extrapolate beyond 8 years
 RUL_ALPHA_CREDIBILITY_MULT  = 2.0     # Fitted alpha ≤ 2× lifetime-observed alpha (noise guard)
 RECENT_KM_WINDOW_DAYS       = 60      # Window for recent km/day estimate
 TOTAL_DISTANCE_MAX_KM       = 500_000.0  # Fault-code filter: INT32_MAX/100 ≈ 21,474,836 is a known
@@ -3419,9 +3419,16 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
 
     soh_now = float(soh_seq[-1])
 
-    # Initial SOH from first 10% of sessions
-    _n_init = max(3, min(20, n // 10))
-    S0      = float(np.nanmedian(soh_seq[:_n_init]))
+    # Initial SOH: look at first 20% of sessions, skip any below eol+5%
+    # (guards against early calibration sessions corrupting S0 — e.g. 133336 starting at 74%)
+    _n_init  = max(3, min(20, n // 10))
+    _n_wide  = max(_n_init, min(30, n // 5))
+    _early   = soh_seq[:_n_wide]
+    _plaus   = _early[_early > eol + 5.0]
+    if len(_plaus) >= 3:
+        S0 = float(np.nanmedian(_plaus[:_n_init]))
+    else:
+        S0 = float(np.nanpercentile(_early, 75))   # robust upward estimate when all early sessions are low
 
     data_span_days = (hrlfc_seq[-1] - t0) * hrlfc_to_days
     hrlfc_per_year = 365.0 / hrlfc_to_days
@@ -3447,7 +3454,9 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     weighted_ssx = float(np.sum(wv * xv ** 2))
     dof          = max(int(valid.sum()) - 1, 1)
     alpha_se     = float(np.sqrt(weighted_sse / dof / max(weighted_ssx, 1e-12)))
-    alpha_se     = max(alpha_se, abs(alpha) * 0.20)
+    # SE floor scales with data scarcity: 40% when no span data, 20% at full span (120+ days)
+    _se_floor_mult = 0.20 + 0.20 * max(0.0, 1.0 - data_span_days / RUL_MIN_DATA_SPAN_DAYS)
+    alpha_se     = max(alpha_se, abs(alpha) * _se_floor_mult)
 
     _n10       = max(3, n // 10)
     _s_e       = float(np.nanmedian(soh_seq[:_n10]))
@@ -3483,7 +3492,7 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
 
     soh_remaining = max(S0 - eol, 0.0)
 
-    # Fix D: hard cap helper — 60 months max on any RUL days value
+    # Fix D: hard cap helper — 96 months max on any RUL days value
     _rul_max_days = RUL_MAX_MONTHS * 30.4375
     _cap = lambda d: min(d, _rul_max_days) if np.isfinite(d) else d
 
@@ -3545,10 +3554,10 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
             'phase2_slope'  : tangent_slope, 'slope_se': alpha_se,
             'sqrt_alpha'    : 0.0, 'soh_initial': S0,
             'soh_now'       : soh_now, 'hrlfc_now': hrlfc_now,
-            'rul_hrlfc_p10' : np.nan,
+            'rul_hrlfc_p10' : rul_floor_h * 0.5,
             'rul_hrlfc_p50' : rul_floor_h,
             'rul_hrlfc_p90' : rul_floor_h * 2.0,
-            'rul_days_p10'  : np.nan,
+            'rul_days_p10'  : _cap(rul_floor_d * 0.5),   # pessimistic: 2× assumed floor rate
             'rul_days_p50'  : rul_floor_d,
             'rul_days_p90'  : _cap(rul_floor_d * 2.0),
             'slope_basis'   : floor_basis,
