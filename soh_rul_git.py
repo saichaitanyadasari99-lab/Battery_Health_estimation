@@ -1880,6 +1880,13 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
         return
 
     ev = replacement_events.copy()
+    ev = ev[
+        (pd.to_numeric(ev['soh_jump_pct'], errors='coerce') >= 5.0) &
+        (pd.to_numeric(ev['confidence'],   errors='coerce') >= 0.95)
+    ]
+    if ev.empty:
+        print("\n[REPLACEMENT TABLE] No likely battery replacement events detected.")
+        return
     ev_show = pd.DataFrame({
         'Vehicle': ev['vehicle_id'].map(_normalize_vehicle_id_text),
         'SessionIdx': ev['event_session_idx'],
