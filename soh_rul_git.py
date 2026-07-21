@@ -3704,20 +3704,26 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             soh_seq   = _finite_series(g[soh_col]).values
 
         # Detect pack replacement by upward SOH jump when BMS counter did not reset.
-        # Always detect on raw soh_xgb — LSTM predictions are smooth and hide the jump.
+        # Use soh_label (raw energy-based SOH) — XGBoost/LSTM predictions are smooth
+        # functions of HRLFC and hide the jump. soh_label shows the true per-session jump.
         # Old-pack sessions would corrupt S0 and the sqrt slope if included — clip them out.
-        _xgb_seq     = _finite_series(g['soh_xgb']).values.astype(float) if 'soh_xgb' in g.columns else soh_seq
-        _epoch_in_g  = _detect_soh_jump_epoch(_xgb_seq)
+        for _det_col in ('soh_label', 'soh_xgb'):
+            if _det_col in g.columns:
+                _det_seq = _finite_series(g[_det_col]).values.astype(float)
+                break
+        else:
+            _det_seq = soh_seq
+        _epoch_in_g  = _detect_soh_jump_epoch(_det_seq)
         if _epoch_in_g is not None:
             _lb_offset       = lstm_results[vid]['lookback'] if vid in lstm_results else 0
             _soh_epoch_start = max(0, _epoch_in_g - _lb_offset)
             if _soh_epoch_start < len(soh_seq) - 5:
                 _post_n   = len(soh_seq) - _soh_epoch_start
                 _win      = min(10, max(1, _post_n))
-                _pre_med  = float(np.nanmedian(_xgb_seq[max(0, _epoch_in_g - 10):_epoch_in_g]))
-                _post_med = float(np.nanmedian(_xgb_seq[_epoch_in_g:_epoch_in_g + _win]))
+                _pre_med  = float(np.nanmedian(_det_seq[max(0, _epoch_in_g - 10):_epoch_in_g]))
+                _post_med = float(np.nanmedian(_det_seq[_epoch_in_g:_epoch_in_g + _win]))
                 print(f"    [SOH-Jump] {vid}: replacement — SOH {_pre_med:.1f}% → {_post_med:.1f}% "
-                      f"at session {_epoch_in_g}. RUL using post-replacement epoch "
+                      f"at session {_epoch_in_g} (from {_det_col}). RUL using post-replacement epoch "
                       f"({_post_n} sessions).")
                 hrlfc_seq = hrlfc_seq[_soh_epoch_start:] - hrlfc_seq[_soh_epoch_start]
                 soh_seq   = soh_seq[_soh_epoch_start:]
