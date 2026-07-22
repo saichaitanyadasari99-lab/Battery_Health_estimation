@@ -3585,6 +3585,67 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
 
     return _make_nan(soh_now, hrlfc_now)
 
+def _find_replacement_epoch(g: pd.DataFrame,
+                             min_soh_jump: float = 5.0,
+                             min_conf: float = 0.95) -> int | None:
+    """
+    Run replacement detection on an already-sorted session dataframe and return
+    the position (integer index into g) of the best replacement event, or None.
+    Uses identical window-median logic as detect_battery_replacements so the
+    result maps directly onto hrlfc_seq / soh_seq built from the same g.
+    """
+    w = int(REPL_WINDOW)
+    m = int(REPL_PERSIST_M)
+    k = int(REPL_PERSIST_K)
+    n = len(g)
+    if n < 2 * w + 3:
+        return None
+
+    q   = _finite_series(g['implied_Q_Ah']) if 'implied_Q_Ah' in g.columns else pd.Series(np.nan, index=g.index)
+    soh = _finite_series(g['soh_label'])    if 'soh_label'   in g.columns else pd.Series(np.nan, index=g.index)
+
+    best_pos, best_conf = None, -1.0
+    i = w
+    while i < n - w - 1:
+        pre_q   = float(np.nanmedian(q.iloc[i - w:i]))   if q.iloc[i - w:i].notna().any()   else np.nan
+        post_q  = float(np.nanmedian(q.iloc[i+1:i+1+w])) if q.iloc[i+1:i+1+w].notna().any() else np.nan
+        pre_soh = float(np.nanmedian(soh.iloc[i - w:i]))   if soh.iloc[i - w:i].notna().any()   else np.nan
+        post_soh= float(np.nanmedian(soh.iloc[i+1:i+1+w])) if soh.iloc[i+1:i+1+w].notna().any() else np.nan
+
+        q_jump_ah  = (post_q  - pre_q)  if np.isfinite(pre_q)  and np.isfinite(post_q)  else np.nan
+        q_jump_pct = (100.0 * q_jump_ah / pre_q) if np.isfinite(q_jump_ah) and pre_q > 0 else np.nan
+        soh_jump   = (post_soh - pre_soh) if np.isfinite(pre_soh) and np.isfinite(post_soh) else np.nan
+
+        cond_q   = np.isfinite(q_jump_pct) and np.isfinite(q_jump_ah) and q_jump_pct >= REPL_Q_JUMP_PCT and q_jump_ah >= REPL_Q_JUMP_AH
+        cond_soh = np.isfinite(soh_jump)   and soh_jump >= REPL_SOH_JUMP_PCT
+        if not (cond_q or cond_soh):
+            i += 1
+            continue
+
+        end    = min(n, i + 1 + m)
+        next_q = q.iloc[i+1:end];  next_soh = soh.iloc[i+1:end]
+        q_thresh   = pre_q   * (1.0 + 0.6 * REPL_Q_JUMP_PCT / 100.0) if np.isfinite(pre_q)   else np.nan
+        soh_thresh = pre_soh + 0.6 * REPL_SOH_JUMP_PCT                if np.isfinite(pre_soh) else np.nan
+        keep_q   = np.isfinite(q_thresh)   and int((next_q   >= q_thresh  ).sum()) >= k
+        keep_soh = np.isfinite(soh_thresh) and int((next_soh >= soh_thresh).sum()) >= k
+        if not (keep_q or keep_soh):
+            i += 1
+            continue
+
+        q_score   = min(1.0, (min(1.0, q_jump_pct / max(REPL_Q_JUMP_PCT, 1e-9)) + min(1.0, q_jump_ah / max(REPL_Q_JUMP_AH, 1e-9))) / 2.0) if np.isfinite(q_jump_pct) else 0.0
+        soh_score = min(1.0, max(0.0, soh_jump / max(REPL_SOH_JUMP_PCT, 1e-9))) if np.isfinite(soh_jump) else 0.0
+        pers_score= min(1.0, max(int((next_q >= q_thresh).sum()) if np.isfinite(q_thresh) else 0,
+                                 int((next_soh >= soh_thresh).sum()) if np.isfinite(soh_thresh) else 0) / max(k, 1))
+        conf = 0.45 * q_score + 0.35 * soh_score + 0.20 * pers_score
+
+        if conf >= min_conf and np.isfinite(soh_jump) and soh_jump >= min_soh_jump and conf > best_conf:
+            best_pos, best_conf = i + 1, conf
+
+        i += w
+
+    return best_pos
+
+
 def _detect_soh_jump_epoch(soh_seq: np.ndarray, min_jump_pp: float = 12.0,
                             min_post_sessions: int = 10):
     """
@@ -3714,54 +3775,16 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             soh_col   = 'soh_xgb' if 'soh_xgb' in g.columns else 'soh_display'
             soh_seq   = _finite_series(g[soh_col]).values
 
-        # Detect pack replacement — use authoritative replacement_events table (already
-        # filtered to conf >= 0.95 and SOH jump >= 5pp) so no threshold re-tuning needed.
-        # Fall back to soh_label rolling-median detection only if table is unavailable.
-        _epoch_in_g = None
-        _repl_source = None
-        if replacement_events is not None and not replacement_events.empty:
-            _rv = replacement_events[replacement_events['vehicle_id'] == vid]
-            if not _rv.empty:
-                # Use the highest-confidence event; ties broken by largest SOH jump
-                _rv = _rv.sort_values(['confidence', 'soh_jump_pct'], ascending=False)
-                _best = _rv.iloc[0]
-                # Map replacement event back to g's sort order.
-                # detect_battery_replacements sorts by start_utc; compute_all_rul sorts
-                # by hrlfc_mid — so integer session indices differ. Match by hrlfc_mid
-                # value (unique per session) to get the correct position in g.
-                _ev_hrlfc = float(_best.get('event_hrlfc_mid', np.nan))
-                _ev_utc   = float(_best.get('event_session_utc', np.nan))
-                _epoch_in_g = None
-                if np.isfinite(_ev_hrlfc) and 'hrlfc_mid' in g.columns:
-                    _harr = pd.to_numeric(g['hrlfc_mid'], errors='coerce').values
-                    _m = np.where(np.isclose(_harr, _ev_hrlfc, atol=0.5))[0]
-                    if len(_m) > 0:
-                        _epoch_in_g = int(_m[0])
-                if _epoch_in_g is None and np.isfinite(_ev_utc) and 'start_utc' in g.columns:
-                    _uarr = pd.to_numeric(g['start_utc'], errors='coerce').values
-                    _m = np.where(np.isclose(_uarr, _ev_utc, atol=1.0))[0]
-                    if len(_m) > 0:
-                        _epoch_in_g = int(_m[0])
-                if _epoch_in_g is None:
-                    _epoch_in_g = int(_best['event_session_idx'])
-                _repl_source = f"replacement_events (conf={_best['confidence']:.2f}, jump={_best['soh_jump_pct']:.1f}pp)"
-        if _epoch_in_g is None:
-            for _det_col in ('soh_label', 'soh_xgb'):
-                if _det_col in g.columns:
-                    _det_seq = _finite_series(g[_det_col]).values.astype(float)
-                    break
-            else:
-                _det_seq = soh_seq
-            _epoch_in_g  = _detect_soh_jump_epoch(_det_seq)
-            _repl_source = _det_col if _epoch_in_g is not None else None
-
+        # Detect pack replacement directly on the already-sorted g so the returned
+        # position maps 1:1 onto hrlfc_seq / soh_seq — no cross-sort index translation.
+        _epoch_in_g = _find_replacement_epoch(g, min_soh_jump=5.0, min_conf=0.95)
         if _epoch_in_g is not None:
             _lb_offset       = lstm_results[vid]['lookback'] if vid in lstm_results else 0
             _soh_epoch_start = max(0, _epoch_in_g - _lb_offset)
             if _soh_epoch_start < len(soh_seq) - 5:
                 _post_n = len(soh_seq) - _soh_epoch_start
-                print(f"    [SOH-Jump] {vid}: pack replacement at session {_epoch_in_g} "
-                      f"via {_repl_source}. RUL using post-replacement epoch ({_post_n} sessions).")
+                print(f"    [SOH-Jump] {vid}: pack replacement at g-position {_epoch_in_g}. "
+                      f"RUL using post-replacement epoch ({_post_n} sessions).")
                 hrlfc_seq = hrlfc_seq[_soh_epoch_start:] - hrlfc_seq[_soh_epoch_start]
                 soh_seq   = soh_seq[_soh_epoch_start:]
 
