@@ -1653,7 +1653,8 @@ def detect_battery_replacements(xgb_results: dict) -> pd.DataFrame:
                 continue
 
             event_row = g.iloc[i + 1]
-            utc_ev = float(event_row['start_utc']) if ('start_utc' in g.columns and np.isfinite(pd.to_numeric(event_row['start_utc'], errors='coerce'))) else np.nan
+            utc_ev    = float(event_row['start_utc'])   if ('start_utc'  in g.columns and np.isfinite(pd.to_numeric(event_row['start_utc'],  errors='coerce'))) else np.nan
+            hrlfc_ev  = float(event_row['hrlfc_mid'])   if ('hrlfc_mid'  in g.columns and np.isfinite(pd.to_numeric(event_row['hrlfc_mid'],  errors='coerce'))) else np.nan
             dt_ev = _utc_to_ist_datetime(utc_ev)
 
             q_score = 0.0
@@ -1671,7 +1672,8 @@ def detect_battery_replacements(xgb_results: dict) -> pd.DataFrame:
                 'vehicle_id': vid,
                 'event_session_idx': int(i + 1),
                 'event_utc': utc_ev,
-                'event_session_utc': utc_ev,  # anchor for cross-sort lookup in compute_all_rul
+                'event_session_utc': utc_ev,
+                'event_hrlfc_mid': hrlfc_ev,  # anchor for cross-sort lookup in compute_all_rul
                 'event_datetime_ist': dt_ev,
                 'pre_q_ah': pre_q,
                 'post_q_ah': post_q,
@@ -3723,15 +3725,24 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 # Use the highest-confidence event; ties broken by largest SOH jump
                 _rv = _rv.sort_values(['confidence', 'soh_jump_pct'], ascending=False)
                 _best = _rv.iloc[0]
-                # Map replacement event back to g's sort order via start_utc match,
-                # because detect_battery_replacements sorts by start_utc while
-                # compute_all_rul may sort by hrlfc_mid — indices differ.
-                _ev_utc = _best.get('event_session_utc', np.nan)
-                if np.isfinite(float(_ev_utc)) and 'start_utc' in g.columns:
-                    _utc_arr = pd.to_numeric(g['start_utc'], errors='coerce').values
-                    _matched = np.where(np.isclose(_utc_arr, float(_ev_utc), atol=1.0))[0]
-                    _epoch_in_g = int(_matched[0]) if len(_matched) > 0 else int(_best['event_session_idx'])
-                else:
+                # Map replacement event back to g's sort order.
+                # detect_battery_replacements sorts by start_utc; compute_all_rul sorts
+                # by hrlfc_mid — so integer session indices differ. Match by hrlfc_mid
+                # value (unique per session) to get the correct position in g.
+                _ev_hrlfc = float(_best.get('event_hrlfc_mid', np.nan))
+                _ev_utc   = float(_best.get('event_session_utc', np.nan))
+                _epoch_in_g = None
+                if np.isfinite(_ev_hrlfc) and 'hrlfc_mid' in g.columns:
+                    _harr = pd.to_numeric(g['hrlfc_mid'], errors='coerce').values
+                    _m = np.where(np.isclose(_harr, _ev_hrlfc, atol=0.5))[0]
+                    if len(_m) > 0:
+                        _epoch_in_g = int(_m[0])
+                if _epoch_in_g is None and np.isfinite(_ev_utc) and 'start_utc' in g.columns:
+                    _uarr = pd.to_numeric(g['start_utc'], errors='coerce').values
+                    _m = np.where(np.isclose(_uarr, _ev_utc, atol=1.0))[0]
+                    if len(_m) > 0:
+                        _epoch_in_g = int(_m[0])
+                if _epoch_in_g is None:
                     _epoch_in_g = int(_best['event_session_idx'])
                 _repl_source = f"replacement_events (conf={_best['confidence']:.2f}, jump={_best['soh_jump_pct']:.1f}pp)"
         if _epoch_in_g is None:
