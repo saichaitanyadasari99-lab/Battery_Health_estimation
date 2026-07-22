@@ -3841,7 +3841,11 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         # noise) yet has no monotone lock-in so it can recover after a dip.
         _soh_now_col = 'soh_display' if 'soh_display' in g.columns else 'soh_label'
         if _soh_now_col in g.columns:
-            _soh_now_vals = _finite_series(g[_soh_now_col]).dropna()
+            # Use UTC ordering to identify the chronologically latest session.
+            # hrlfc can reset after a telematics device replacement, making the
+            # max-hrlfc session older than the true latest session by calendar time.
+            _g_for_now = g.sort_values('start_utc') if 'start_utc' in g.columns else g
+            _soh_now_vals = _finite_series(_g_for_now[_soh_now_col]).dropna()
             if len(_soh_now_vals) > 0:
                 soh_now = float(_soh_now_vals.iloc[-1])
                 rul['soh_now'] = soh_now
