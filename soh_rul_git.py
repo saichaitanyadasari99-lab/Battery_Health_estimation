@@ -994,19 +994,57 @@ def _clean_odometer(dist_series: pd.Series) -> np.ndarray:
 
 def _pick_axis_col(df: pd.DataFrame) -> str:
     """
-    Prefer hrlfc_mid only when it has enough finite variation.
-    Fall back to start_utc, then synthetic session index.
+    Prefer hrlfc_mid when it has enough finite variation AND is monotone with
+    UTC time (corr >= 0.5). If hrlfc has reset mid-stream (device replacement),
+    corr drops below 0.5 and we fall back to start_utc.
+
+    Before accepting start_utc, validate it is itself monotone (not corrupted)
+    and has a plausible calendar span (1 day – 10 years). If UTC is also
+    corrupted, fall back to synthetic session index which is always monotone.
     """
+    def _utc_is_valid(t_series):
+        """Return True if UTC looks like a reliable time axis."""
+        t = t_series.dropna()
+        if len(t) < 5:
+            return False
+        span_days = float((t.max() - t.min()) / 86400.0)
+        # Reject clearly wrong clocks: less than 1 day span with many sessions,
+        # or more than 10 years (likely epoch-zero or far-future corruption).
+        if span_days < 1.0 and len(t) > 50:
+            return False
+        if span_days > 3650.0:
+            return False
+        # UTC should be mostly increasing with session order.
+        pos = np.arange(len(t), dtype=float)
+        if len(t) >= 10:
+            corr_pos_utc = float(pd.Series(t.values).corr(pd.Series(pos)))
+            if np.isfinite(corr_pos_utc) and corr_pos_utc < 0.3:
+                return False
+        return True
+
     if 'hrlfc_mid' in df.columns:
         h = _finite_series(df['hrlfc_mid'])
         min_needed = max(5, int(0.6 * max(len(df), 1)))
         if h.notna().sum() >= min_needed and np.isfinite(h.max() - h.min()) and (h.max() - h.min()) > 0:
-            return 'hrlfc_mid'
+            # Check hrlfc is monotone with UTC. A reset (device replacement)
+            # produces corr(hrlfc, UTC) << 0 and must not be used as the time axis.
+            hrlfc_ok = True
+            if 'start_utc' in df.columns:
+                _ht = df.dropna(subset=['hrlfc_mid', 'start_utc'])[['hrlfc_mid', 'start_utc']]
+                if len(_ht) >= 10:
+                    _corr = float(_ht.corr().iloc[0, 1])
+                    if np.isfinite(_corr) and _corr < 0.5:
+                        hrlfc_ok = False
+            if hrlfc_ok:
+                return 'hrlfc_mid'
+
     if 'start_utc' in df.columns:
         t = _finite_series(df['start_utc'])
         min_needed = max(5, int(0.6 * max(len(df), 1)))
         if t.notna().sum() >= min_needed and np.isfinite(t.max() - t.min()) and (t.max() - t.min()) > 0:
-            return 'start_utc'
+            if _utc_is_valid(t):
+                return 'start_utc'
+
     return '__session_idx'
 
 
