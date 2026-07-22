@@ -3551,10 +3551,22 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
     # Fix C — floor branch: linear rate formula (not quadratic sqrt formula)
     # soh_remaining / (floor_rate_pct/day) gives days to EOL at constant floor rate
     if soh_now > eol:
-        _floor_rate_per_day = RUL_FLOOR_PCT_PER_YEAR / 365.0
+        _early_rich = (np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS
+                       and n >= RUL_MIN_SESSIONS_OVERRIDE)
+        if _early_rich:
+            # New vehicle with many sessions but short calendar span: alpha≈0 is expected
+            # (LFP barely degrades in <120 days). Use 3.5%/year typical electric-bus LFP
+            # rate instead of the ultra-conservative 0.3%/year floor so SOH differences
+            # between vehicles produce differentiated RUL estimates rather than all capping
+            # at 2922. Will be replaced by fitted alpha once 120+ days of data accumulate.
+            _floor_rate_per_day = 3.5 / 365.0
+        else:
+            _floor_rate_per_day = RUL_FLOOR_PCT_PER_YEAR / 365.0
         rul_floor_d = _cap((soh_now - eol) / _floor_rate_per_day)
         rul_floor_h = rul_floor_d / hrlfc_to_days
-        if np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
+        if _early_rich:
+            floor_basis = 'floor_rate_stable_new_vehicle'
+        elif np.isfinite(data_span_days) and data_span_days < RUL_MIN_DATA_SPAN_DAYS:
             floor_basis = 'floor_rate_insufficient_data'
         elif _life_drop > 2.0:
             floor_basis = 'floor_rate_lifetime_slope'
