@@ -3850,6 +3850,32 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 soh_now = float(_soh_now_vals.iloc[-1])
                 rul['soh_now'] = soh_now
 
+        # Fallback: if XGBoost diverges >3pp from its own training target (soh_smooth)
+        # and hrlfc ordering is reliable (corr >= 0.5), the model failed to learn this
+        # vehicle's pattern (typically small partial-charge vehicles at low SOH).
+        # Use soh_smooth (the smoothed energy-based consensus the model was calibrated on)
+        # as the current-state estimate instead.
+        # Guard: skip when hrlfc is non-monotone (corr < 0.5) — in that case soh_smooth
+        # is computed in wrong time order and is itself unreliable.
+        if 'soh_smooth' in g.columns and 'soh_xgb' in g.columns:
+            _g_utc2 = g.sort_values('start_utc') if 'start_utc' in g.columns else g
+            _s_vals = _finite_series(_g_utc2['soh_smooth']).dropna()
+            _x_vals = _finite_series(_g_utc2['soh_xgb']).dropna()
+            if len(_s_vals) > 0 and len(_x_vals) > 0:
+                _s_now = float(_s_vals.iloc[-1])
+                _x_now = float(_x_vals.iloc[-1])
+                _corr_hu = np.nan
+                if 'hrlfc_mid' in g.columns and 'start_utc' in g.columns:
+                    _hu = g.dropna(subset=['hrlfc_mid', 'start_utc'])[['hrlfc_mid', 'start_utc']]
+                    if len(_hu) >= 10:
+                        _corr_hu = float(_hu.corr().iloc[0, 1])
+                if np.isfinite(_corr_hu) and _corr_hu >= 0.5 and abs(_x_now - _s_now) > 3.0:
+                    print(f"    [SOH-Smooth-Fallback] {vid}: soh_xgb={_x_now:.2f}% diverges "
+                          f"{_x_now - _s_now:+.2f}% from soh_smooth={_s_now:.2f}%; "
+                          f"using soh_smooth as soh_now (corr_hrlfc_utc={_corr_hu:.3f})")
+                    soh_now = _s_now
+                    rul['soh_now'] = soh_now
+
         # If LSTM soh_pred (monotone-clamped) drove extrapolate_rul to conclude
         # already_at_eol, but soh_display shows current SOH is above EOL threshold,
         # the LSTM prediction was corrupted by old dip/pack-change data.
