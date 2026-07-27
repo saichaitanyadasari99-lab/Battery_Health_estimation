@@ -46,7 +46,7 @@ import pandas as pd
 import numpy as np
 import warnings
 from pathlib import Path
-from scipy import stats
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -140,9 +140,7 @@ RUL_MIN_SESSIONS_OVERRIDE   = 150     # Bypass 120-day span guard if vehicle has
 RUL_MAX_MONTHS              = 96      # Hard cap: don't extrapolate beyond 8 years
 RUL_ALPHA_CREDIBILITY_MULT  = 2.0     # Fitted alpha ≤ 2× lifetime-observed alpha (noise guard)
 RECENT_KM_WINDOW_DAYS       = 60      # Window for recent km/day estimate
-TOTAL_DISTANCE_MAX_KM       = 500_000.0  # Fault-code filter: INT32_MAX/100 ≈ 21,474,836 is a known
-                                          # telematics overflow sentinel; any value above 500k km is
-                                          # physically impossible for a city-fleet bus and is discarded.
+
 REPL_WINDOW = 8                       # Sessions per side for replacement medians
 REPL_PERSIST_M = 6                    # Lookahead window for persistence
 REPL_PERSIST_K = 3                    # Required confirmations in lookahead
@@ -155,7 +153,7 @@ CONFIRM_THRESHOLD   = 3.0             # pp — within this of confirmed SOH → 
 # ------------------------------------------------------------------------------
 PROFILE_DEFAULT_NAME = "conservative"
 PROFILE_DEFAULT_PATH = "ev_pipeline_profiles.json"
-STATE_DEFAULT_PATH = "ev_pipeline_state.pkl"   # legacy — kept for migration only
+
 STATE_DIR_NAME     = "states"                   # per-vehicle pkl folder
 INCREMENTAL_OVERLAP_HOURS = 24.0
 
@@ -348,7 +346,7 @@ def apply_config_profile(profile_name: str = PROFILE_DEFAULT_NAME, profile_path:
     print(f"    VEHICLE_ID_MODE = {VEHICLE_ID_MODE}")
 
 
-def _resolve_state_path(plot_path: str = None, state_path: str = None) -> Path:
+def _resolve_state_path(state_path: str = None) -> Path:
     if state_path:
         return Path(state_path)
     return Path(__file__).resolve().parent / STATE_DIR_NAME
@@ -449,30 +447,6 @@ def _merge_sessions_cached(old_sessions: pd.DataFrame, new_sessions: pd.DataFram
         out = out.reset_index(drop=True)
     return out
 
-
-def _state_safe_xgb_results(xgb_results: dict) -> dict:
-    out = {}
-    for vid, res in (xgb_results or {}).items():
-        if not isinstance(res, dict):
-            continue
-        rr = dict(res)
-        rr['model'] = None
-        rr['scaler'] = None
-        out[vid] = rr
-    return out
-
-
-def _state_safe_lstm_results(lstm_results: dict) -> dict:
-    out = {}
-    keep = {'lookback', 'soh_seq', 'hrlfc_seq', 'soh_pred'}
-    for vid, res in (lstm_results or {}).items():
-        if not isinstance(res, dict):
-            continue
-        rr = {k: res.get(k) for k in keep if k in res}
-        rr['model'] = None
-        rr['scaler'] = None
-        out[vid] = rr
-    return out
 
 
 def _extract_cached_init_capacity_map(rul_all_cached: dict) -> dict:
@@ -878,87 +852,6 @@ def _remap_pipeline_state_vehicle_ids(state: dict, alias_map: dict) -> dict:
     return remapped
 
 
-def _get_cached_vehicle_ids_from_state(state: dict) -> set:
-    """Collect cached vehicle IDs from state payload."""
-    out = set()
-    if not isinstance(state, dict):
-        return out
-
-    sessions = state.get('sessions')
-    if isinstance(sessions, pd.DataFrame) and 'vehicle_id' in sessions.columns:
-        vals = sessions['vehicle_id'].dropna().astype(str).map(_normalize_vehicle_id_text)
-        out.update(v for v in vals.tolist() if v)
-
-    rul_all = state.get('rul_all', {})
-    if isinstance(rul_all, dict):
-        out.update(_normalize_vehicle_id_text(k) for k in rul_all.keys())
-
-    xgb_results = state.get('xgb_results', {})
-    if isinstance(xgb_results, dict):
-        out.update(_normalize_vehicle_id_text(k) for k in xgb_results.keys())
-
-    return {v for v in out if v}
-
-
-def _scan_vehicle_ids_from_input_path(path_str: str) -> set:
-    """
-    Best-effort vehicle-id scan from input file/folder before full load.
-    Reads only ID-like columns from CSVs.
-    """
-    if not path_str:
-        return set()
-
-    p = Path(path_str)
-    if not p.exists():
-        return set()
-
-    csv_files = []
-    if p.is_file():
-        csv_files = [p]
-    elif p.is_dir():
-        csv_files = sorted(p.glob("**/*.csv")) + sorted(p.glob("**/*.CSV"))
-        dedup = {}
-        for f in csv_files:
-            dedup[str(f.resolve()).lower()] = f
-        csv_files = sorted(dedup.values(), key=lambda x: str(x).lower())
-
-    ids = set()
-    id_alias_norm = {
-        'vehicleid', 'imei', 'deviceimei', 'deviceid', 'vin'
-    }
-
-    for f in csv_files:
-        try:
-            header = list(pd.read_csv(f, nrows=0).columns)
-        except Exception:
-            header = []
-
-        use_cols = []
-        for c in header:
-            n = _norm_col(c)
-            if n in id_alias_norm or ('imei' in n) or ('vehicle' in n and 'id' in n) or ('vin' in n):
-                use_cols.append(c)
-
-        if use_cols:
-            try:
-                tmp = pd.read_csv(f, usecols=use_cols, dtype=str, low_memory=True)
-                for c in use_cols:
-                    if c in tmp.columns:
-                        vv = _clean_id_series(tmp[c]).dropna().astype(str).map(_normalize_vehicle_id_text).unique().tolist()
-                        ids.update(v for v in vv if v)
-            except Exception:
-                pass
-
-        if not ids:
-            m = re.search(r'IMEI[_-]?(\d{10,17})', f.name, flags=re.IGNORECASE)
-            if m:
-                ids.add(_normalize_vehicle_id_text(m.group(1)))
-            else:
-                for tok in re.findall(r'\d{10,17}', f.stem):
-                    ids.add(_normalize_vehicle_id_text(tok))
-
-    return {v for v in ids if v}
-
 
 
 def _finite_series(series: pd.Series) -> pd.Series:
@@ -1160,30 +1053,6 @@ def _apply_confirmation_gate(values,
 
     return out
 
-
-def _unwrap_hrlfc_counter(values, wrap_mod=HRLFC_WRAP_MOD, reset_margin=500.0):
-    """
-    Unwrap a modulo counter (e.g., 16-bit 0..65535) into a monotone series.
-    Adds +wrap_mod on true wrap events instead of compounding by prior cumulative value.
-    """
-    arr = pd.to_numeric(pd.Series(values), errors='coerce').values.astype(float)
-    out = np.full(len(arr), np.nan, dtype=float)
-
-    wraps = 0.0
-    last_raw = np.nan
-    for i, v in enumerate(arr):
-        if np.isnan(v):
-            continue
-
-        if np.isfinite(last_raw):
-            # Wrap when current raw value drops sharply from the previous raw value.
-            if v + reset_margin < last_raw:
-                wraps += wrap_mod
-
-        out[i] = v + wraps
-        last_raw = v
-
-    return out
 
 
 def _calibrate_capacity_ah(q_raw, options=None, scales=None):
@@ -2856,7 +2725,6 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.DataFrame:
     chg_type   = pd.Series('none', index=idx, dtype=str)
     chg_jump   = pd.Series(np.nan, index=idx, dtype=float)
 
-    chg_mask   = is_pack_change.values
     chg_type.values[hrlfc_reset.values & partial_jump.values] = 'partial'
     chg_type.values[hrlfc_reset.values & full_jump.values]    = 'full'
     chg_jump[is_pack_change] = q_frac_change[is_pack_change]
@@ -3705,25 +3573,6 @@ def _find_replacement_epoch(g: pd.DataFrame,
 
     return best_pos
 
-
-def _detect_soh_jump_epoch(soh_seq: np.ndarray, min_jump_pp: float = 12.0,
-                            min_post_sessions: int = 10):
-    """
-    Find the last large upward SOH jump (>= min_jump_pp pp) that signals a pack
-    replacement when the HRLFC counter did not reset (BMS odometer kept running).
-    Uses a 5-session rolling median to suppress single-session noise.
-    Returns the index of the first session of the post-replacement epoch, or None.
-    """
-    n = len(soh_seq)
-    if n < min_post_sessions + 5:
-        return None
-    roll = pd.Series(soh_seq).rolling(5, min_periods=2).median().values
-    last_epoch_start = None
-    for i in range(1, n - min_post_sessions):
-        if np.isfinite(roll[i]) and np.isfinite(roll[i - 1]):
-            if (roll[i] - roll[i - 1]) >= min_jump_pp:
-                last_epoch_start = i
-    return last_epoch_start
 
 
 def _fit_ah_model_for_rul(g: pd.DataFrame, soh_col: str = 'soh_display',
@@ -5004,7 +4853,7 @@ def run_pipeline(
 ):
     _validate_runtime_config()
 
-    state_file = _resolve_state_path(plot_path=plot_path, state_path=state_path)
+    state_file = _resolve_state_path(state_path=state_path)
     state = _load_pipeline_state(state_file) if incremental else None
     prev_sessions = None
     since_utc = None
@@ -5202,35 +5051,34 @@ def run_pipeline(
     export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
 
     # Always save state (full or inc) so the next inc run has correct sessions.
-    if True:
-        # Compute per-vehicle watermarks from the raw data max utc.
-        new_watermarks = dict(watermarks)  # carry forward existing
-        if '_utc_num' in df_raw.columns and 'vehicle_id' in df_raw.columns:
-            for vid, grp in df_raw.groupby('vehicle_id', observed=True):
-                vid_str = str(vid)
-                vmax = _finite_series(grp['_utc_num']).max()
-                if np.isfinite(vmax):
-                    prev_wm = new_watermarks.get(vid_str, np.nan)
-                    new_watermarks[vid_str] = float(vmax) if (not np.isfinite(float(prev_wm if prev_wm else np.nan)) or float(vmax) > float(prev_wm)) else float(prev_wm)
+    # Compute per-vehicle watermarks from the raw data max utc.
+    new_watermarks = dict(watermarks)  # carry forward existing
+    if '_utc_num' in df_raw.columns and 'vehicle_id' in df_raw.columns:
+        for vid, grp in df_raw.groupby('vehicle_id', observed=True):
+            vid_str = str(vid)
+            vmax = _finite_series(grp['_utc_num']).max()
+            if np.isfinite(vmax):
+                prev_wm = new_watermarks.get(vid_str, np.nan)
+                new_watermarks[vid_str] = float(vmax) if (not np.isfinite(float(prev_wm if prev_wm else np.nan)) or float(vmax) > float(prev_wm)) else float(prev_wm)
 
-        # Extract init capacity and pack context from rul_all results.
-        new_init_map = dict(cached_init_map)
-        new_pack_ctx = dict(cached_pack_ctx)
-        for vid, rr in (rul_all or {}).items():
-            if not isinstance(rr, dict):
-                continue
-            ic = rr.get('q_base_for_soh_ah', rr.get('init_capacity_ah', np.nan))
-            ic = pd.to_numeric(pd.Series([ic]), errors='coerce').iloc[0]
-            if np.isfinite(ic) and ic > 0:
-                new_init_map[str(vid)] = float(ic)
-            ctx = {
-                'pack_config_guess'   : str(rr.get('pack_config_guess', 'unknown')),
-                'pack_score_confidence': float(rr.get('pack_score_confidence', np.nan)),
-                'config_epoch_id'     : int(rr.get('config_epoch_id', 0)),
-            }
-            new_pack_ctx[str(vid)] = ctx
+    # Extract init capacity and pack context from rul_all results.
+    new_init_map = dict(cached_init_map)
+    new_pack_ctx = dict(cached_pack_ctx)
+    for vid, rr in (rul_all or {}).items():
+        if not isinstance(rr, dict):
+            continue
+        ic = rr.get('q_base_for_soh_ah', rr.get('init_capacity_ah', np.nan))
+        ic = pd.to_numeric(pd.Series([ic]), errors='coerce').iloc[0]
+        if np.isfinite(ic) and ic > 0:
+            new_init_map[str(vid)] = float(ic)
+        ctx = {
+            'pack_config_guess'   : str(rr.get('pack_config_guess', 'unknown')),
+            'pack_score_confidence': float(rr.get('pack_score_confidence', np.nan)),
+            'config_epoch_id'     : int(rr.get('config_epoch_id', 0)),
+        }
+        new_pack_ctx[str(vid)] = ctx
 
-        _save_pipeline_state(state_file, sessions, new_watermarks, new_init_map, new_pack_ctx)
+    _save_pipeline_state(state_file, sessions, new_watermarks, new_init_map, new_pack_ctx)
 
     return xgb_results, lstm_results, rul_all
 
@@ -5288,7 +5136,7 @@ if __name__ == '__main__':
     print(f"  Profile   : {profile_name}")
     print(f"  Profile JSON : {profile_path if profile_path else 'None'}")
     print(f"  Incremental mode : {'ON' if incremental_mode else 'OFF'}")
-    print(f"  State path : {_resolve_state_path(plot_path=plot_path, state_path=explicit_state_path)}")
+    print(f"  State path : {_resolve_state_path(state_path=explicit_state_path)}")
     print("=" * 70)
 
     # Helpful cross-platform startup check.
