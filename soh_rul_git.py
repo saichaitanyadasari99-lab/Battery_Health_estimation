@@ -123,8 +123,8 @@ PACK_FIXED_BASELINE_AH = {
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
                                        # Keeps small-swing sessions (high SOC-rounding noise) out of training.
-AH_MODEL_MIN_SESSIONS       = 200      # Min charging sessions for reliable Ah-throughput RUL
-AH_MODEL_MIN_DAYS           = 365.0    # Min calendar days of history for reliable RUL
+AH_MODEL_MIN_SESSIONS       = 100      # Min charging sessions for reliable Ah-throughput RUL
+AH_MODEL_MIN_DAYS           = 90.0     # Min calendar days of history for reliable RUL
 RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
 RUL_TAIL_FRACTION           = 0.50    # Fraction of sessions used for WLS slope (recent half)
@@ -4024,6 +4024,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 rul['soh_now'] = soh_now
 
         # ── Ah-throughput RUL override (365-day Ah/day window) ─────────────────
+        print(f"    [Ah guard] {vid}: days_span={days_span:.0f}d  sessions={len(g)}")
         _span_ok = np.isfinite(days_span) and days_span >= AH_MODEL_MIN_DAYS
         _sess_ok = len(g) >= AH_MODEL_MIN_SESSIONS
 
