@@ -3837,6 +3837,13 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         utc_span = (utc_vals.max() - utc_vals.min()) if utc_vals.notna().sum() >= 2 else np.nan
         days_span = (utc_span / 86400) if np.isfinite(utc_span) else np.nan
         last_utc = utc_vals.max() if utc_vals.notna().sum() >= 1 else np.nan
+        # Fallback: derive span from session-level start_utc when raw telemetry didn't yield a valid span
+        if not np.isfinite(days_span) and 'start_utc' in g.columns:
+            _sess_utc = _finite_series(g['start_utc'])
+            if _sess_utc.notna().sum() >= 2:
+                days_span = float((_sess_utc.max() - _sess_utc.min()) / 86400.0)
+                if not np.isfinite(last_utc):
+                    last_utc = float(_sess_utc.max())
         last_dt_ist = _utc_to_ist_datetime(last_utc) if np.isfinite(last_utc) else pd.NaT
 
         # Sort by time, clean the odometer series (zeros / spikes / trip-counter values)
