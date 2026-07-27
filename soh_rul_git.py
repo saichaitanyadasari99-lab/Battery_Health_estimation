@@ -22,7 +22,7 @@ Flow:
     -> [Step 4] train_lstm_trajectory() â€” LSTM SOH trajectory
     -> [Step 5] compute_all_rul()       â€” RUL (days to 80% EOL)
     -> [Step 6] detect_battery_replacements()
-    -> Plots + CSV exports
+    -> Plots + console tables
 
 v2 fixes (original pipeline):
   - Dynamic per-vehicle Q bounds (no hardcoded limits)
@@ -4699,9 +4699,6 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
     print(f"\n  Customer dashboard -> {dash_path}")
     print(f"  Customer vehicle cards -> {cards_dir}")
 
-
-
-    print(f"\n  CSV exports -> {out_dir}")
 
 # ------------------------------------------------------------------------------
 # MAIN
