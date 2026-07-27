@@ -51,6 +51,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.interpolate import PchipInterpolator, UnivariateSpline
+from scipy.optimize import curve_fit
 
 warnings.filterwarnings('ignore')
 
@@ -3396,6 +3397,7 @@ def train_lstm_trajectory(xgb_results: dict, lookback: int = 10) -> dict:
         lstm_results[vid] = {
             'model': model, 'scaler': scaler_lstm, 'lookback': lookback,
             'soh_seq': soh_seq, 'hrlfc_seq': hrlfc_seq, 'soh_pred': soh_pred,
+            'sort_col': sort_col,
         }
         print(f"    {vid}: LSTM trained on {len(soh_seq)} sessions")
 
@@ -3716,10 +3718,87 @@ def _detect_soh_jump_epoch(soh_seq: np.ndarray, min_jump_pp: float = 12.0,
     return last_epoch_start
 
 
+def _fit_ah_model_for_rul(g: pd.DataFrame, soh_col: str = 'soh_display',
+                           eol: float = SOH_EOL, min_pts: int = 30) -> dict:
+    """
+    Fit SOH = S0 - alpha*sqrt(cumulative_Ah) for one vehicle.
+    Returns dict with s0, alpha, r2, cum_ah_now, cum_ah_start, ah_to_eol,
+    rate_90d, rate_365d. Empty dict on failure.
+    """
+    if soh_col not in g.columns or 'ah_total' not in g.columns or 'start_utc' not in g.columns:
+        return {}
+    g = g.copy()
+    for c in [soh_col, 'ah_total', 'start_utc']:
+        g[c] = pd.to_numeric(g[c], errors='coerce')
+    g = g.sort_values('start_utc').reset_index(drop=True)
+    g['_cum_ah'] = g['ah_total'].fillna(0).cumsum()
+    v = g.dropna(subset=['_cum_ah', soh_col])
+    if len(v) < min_pts:
+        return {}
+    cum = v['_cum_ah'].values.astype(float)
+    soh = v[soh_col].values.astype(float)
+    ok  = np.isfinite(cum) & np.isfinite(soh) & (cum >= 0)
+    if ok.sum() < min_pts:
+        return {}
+    xf, yf = cum[ok], soh[ok]
+    xn = xf - xf.min()
+
+    def _sqrt_m(x, s0, a):
+        return s0 - a * np.sqrt(np.maximum(x, 0))
+
+    try:
+        popt, _ = curve_fit(_sqrt_m, xn, yf, p0=[yf.max(), 0.001],
+                            bounds=([50, -2], [110, 10]), maxfev=8000)
+        s0, alpha = float(popt[0]), float(popt[1])
+        yp   = _sqrt_m(xn, s0, alpha)
+        ss_r = float(np.sum((yf - yp) ** 2))
+        ss_t = float(np.sum((yf - yf.mean()) ** 2))
+        r2   = 1.0 - ss_r / ss_t if ss_t > 0 else np.nan
+    except Exception:
+        return {}
+
+    cum_start = float(v['_cum_ah'].iloc[0])
+    cum_now   = float(v['_cum_ah'].iloc[-1])
+    x_now     = cum_now - cum_start
+    x_eol     = ((s0 - eol) / alpha) ** 2 if alpha > 1e-9 else np.nan
+    ah_to_eol = max(float(x_eol) - x_now, 0.0) if np.isfinite(x_eol) else np.nan
+
+    last_utc   = float(v['start_utc'].max())
+    span_d     = (v['start_utc'].max() - v['start_utc'].min()) / 86400.0
+    span_ah    = float(v['ah_total'].fillna(0).sum())
+    fallback_r = span_ah / span_d if span_d > 0 else np.nan
+
+    rec90  = v[v['start_utc'] >= last_utc - 90  * 86400]
+    rec365 = v[v['start_utc'] >= last_utc - 365 * 86400]
+    rate_90d  = float(rec90['ah_total'].fillna(0).sum()  / 90.0)  if len(rec90)  >= 5 else fallback_r
+    rate_365d = float(rec365['ah_total'].fillna(0).sum() / 365.0) if len(rec365) >= 5 else fallback_r
+
+    return {
+        's0': s0, 'alpha': alpha, 'r2': r2,
+        'cum_ah_now': cum_now, 'cum_ah_start': cum_start,
+        'ah_to_eol': ah_to_eol,
+        'rate_90d': rate_90d, 'rate_365d': rate_365d,
+    }
+
+
 def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None,
                     replacement_events: pd.DataFrame = None) -> dict:
     print("[6/6] Computing RUL...")
     rul_all = {}
+
+    # ── Ah-throughput pre-pass: fit SOH=S0-alpha*sqrt(cum_Ah) per vehicle ──────
+    _ah_model_fits = {}
+    for _vid, _res in xgb_results.items():
+        _sc = 'soh_display' if 'soh_display' in _res['sessions'].columns else 'soh_xgb'
+        _ah_model_fits[_vid] = _fit_ah_model_for_rul(_res['sessions'], soh_col=_sc)
+    _good_alphas = [d['alpha'] for d in _ah_model_fits.values()
+                    if np.isfinite(d.get('alpha', np.nan))
+                    and d.get('r2', 0) > 0.3 and d.get('alpha', 0) > 0.001]
+    _fleet_alpha = float(np.median(_good_alphas)) if _good_alphas else np.nan
+    if np.isfinite(_fleet_alpha):
+        print(f"  [Ah model] fleet alpha = {_fleet_alpha:.5f} %/sqrt(Ah) "
+              f"from {len(_good_alphas)} vehicles")
+    # ──────────────────────────────────────────────────────────────────────────
 
     for vid, res in xgb_results.items():
         g = res['sessions'].copy()
@@ -3928,6 +4007,51 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             if _rr_ok.sum() >= 8:
                 rul = extrapolate_rul(_rr_ax[_rr_ok], _rr_soh[_rr_ok], htd)
                 rul['soh_now'] = soh_now
+
+        # ── Ah-throughput RUL override (365-day Ah/day window) ─────────────────
+        _ah        = _ah_model_fits.get(vid, {})
+        _ah_rate365 = _ah.get('rate_365d', np.nan)
+        _ah_rate90  = _ah.get('rate_90d',  np.nan)
+        _ah_to_eol  = _ah.get('ah_to_eol', np.nan)
+        _ah_r2      = _ah.get('r2',         np.nan)
+        _ah_alpha_v = _ah.get('alpha',      np.nan)
+        _sqrtt_p50  = rul.get('rul_days_p50', np.nan)
+        _ah_p50 = _ah_p10 = _ah_p90 = np.nan
+        _ah_basis = None
+
+        if (np.isfinite(_ah_r2) and _ah_r2 > 0.3
+                and np.isfinite(_ah_to_eol) and _ah_to_eol >= 0
+                and np.isfinite(_ah_rate365) and _ah_rate365 > 0):
+            _ah_p50 = _ah_to_eol / _ah_rate365
+            _ah_p10 = (_ah_to_eol / _ah_rate90) if np.isfinite(_ah_rate90) and _ah_rate90 > 0 else _ah_p50 * 0.75
+            _ah_p90 = _ah_p50 * 1.3
+            _ah_basis = 'ah_throughput_model'
+        elif (np.isfinite(_fleet_alpha) and _fleet_alpha > 0
+              and np.isfinite(_ah_rate365) and _ah_rate365 > 0
+              and np.isfinite(soh_now) and soh_now > SOH_EOL):
+            _s0_v = _ah.get('s0', np.nan)
+            if not np.isfinite(_s0_v):
+                _s0_v = min(soh_now + 5.0, 100.0)
+            if (_s0_v - soh_now) > 0:
+                _xn_f = ((_s0_v - soh_now) / _fleet_alpha) ** 2
+                _xe_f = ((_s0_v - SOH_EOL)  / _fleet_alpha) ** 2
+                _fleet_ah_eol = max(_xe_f - _xn_f, 0.0)
+                _ah_p50 = _fleet_ah_eol / _ah_rate365
+                _ah_p10 = (_fleet_ah_eol / _ah_rate90) if np.isfinite(_ah_rate90) and _ah_rate90 > 0 else _ah_p50 * 0.75
+                _ah_p90 = _ah_p50 * 1.3
+                _ah_basis = 'ah_throughput_fleet_alpha'
+
+        if np.isfinite(_ah_p50) and _ah_p50 >= 0:
+            _rul_cap_d = float(REPORT_RUL_CAP_DAYS)
+            _cap_d = lambda d: min(d, _rul_cap_d) if np.isfinite(d) else d
+            rul['rul_days_p10'] = _cap_d(_ah_p10)
+            rul['rul_days_p50'] = _cap_d(_ah_p50)
+            rul['rul_days_p90'] = _cap_d(_ah_p90)
+            rul['slope_basis']  = _ah_basis
+            print(f"    [Ah model] {vid}: R²={_ah_r2:.3f} alpha={_ah_alpha_v:.5f} "
+                  f"rate365={_ah_rate365:.1f} Ah/d  "
+                  f"RUL={_cap_d(_ah_p50):.0f}d (sqrt_t was {_sqrtt_p50:.0f}d)")
+        # ───────────────────────────────────────────────────────────────────────
 
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
         current_cap_ah = (init_cap_ah * soh_now / 100.0) if np.isfinite(init_cap_ah) and np.isfinite(soh_now) else np.nan
@@ -4226,25 +4350,28 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
     for vid, res in xgb_results.items():
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         g = res['sessions'].copy()
-        sort_col = _pick_axis_col(g)
-
-        if sort_col == '__session_idx':
+        # Display: always use UTC elapsed days — hrlfc_mid is unreliable after
+        # device replacements and confusing for non-technical readers.
+        if 'start_utc' in g.columns:
+            _t = _finite_series(g['start_utc'])
+            _mn = max(5, int(0.6 * max(len(g), 1)))
+            if _t.notna().sum() >= _mn and np.isfinite(_t.max() - _t.min()) and (_t.max() - _t.min()) > 0:
+                g = g.sort_values('start_utc').reset_index(drop=True)
+                x_zero = float(_t.min())
+                x = ((_finite_series(g['start_utc']) - x_zero) / 86400.0).values.astype(float)
+                x_label = 'elapsed_days'
+            else:
+                g = g.reset_index(drop=True)
+                g['__session_idx'] = np.arange(len(g), dtype=float)
+                x = g['__session_idx'].values.astype(float)
+                x_label = 'session_idx'
+                x_zero = 0.0
+        else:
+            g = g.reset_index(drop=True)
             g['__session_idx'] = np.arange(len(g), dtype=float)
-            g = g.sort_values('__session_idx')
             x = g['__session_idx'].values.astype(float)
             x_label = 'session_idx'
             x_zero = 0.0
-        elif sort_col == 'start_utc':
-            g = g.sort_values('start_utc')
-            t = _finite_series(g['start_utc'])
-            x_zero = t.min() if t.notna().any() else 0.0
-            x = ((t - x_zero) / 86400.0).values.astype(float)
-            x_label = 'elapsed_days'
-        else:
-            g = g.sort_values('hrlfc_mid')
-            x = _finite_series(g['hrlfc_mid']).values.astype(float)
-            x_label = 'hrlfc_mid'
-            x_zero = np.nanmin(x) if np.isfinite(x).any() else 0.0
 
         y_label = _finite_series(g['soh_label']).values
         y_smooth = _finite_series(g['soh_smooth']).values
@@ -4285,24 +4412,34 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
 
         ax = axes[1]
         if vid in lstm_results:
-            lr = lstm_results[vid]
-            lb = lr['lookback']
+            lr  = lstm_results[vid]
+            lb  = lr['lookback']
+            _lr_sort_col = lr.get('sort_col', 'hrlfc_mid')
 
-            x_all_raw = np.asarray(lr['hrlfc_seq'], dtype=float)
+            # Convert LSTM x-axis to match the display (elapsed_days).
+            # lr['hrlfc_seq'] contains values from the training sort_col.
+            x_all_raw  = np.asarray(lr['hrlfc_seq'],      dtype=float)
             x_pred_raw = np.asarray(lr['hrlfc_seq'][lb:], dtype=float)
+
             if x_label == 'elapsed_days':
-                x_all = (x_all_raw - x_zero) / 86400.0
-                x_pred = (x_pred_raw - x_zero) / 86400.0
+                if _lr_sort_col == 'start_utc':
+                    # hrlfc_seq holds UTC timestamps — convert to elapsed days
+                    x_all  = (x_all_raw  - x_zero) / 86400.0
+                    x_pred = (x_pred_raw - x_zero) / 86400.0
+                else:
+                    # hrlfc_mid or session_idx — use session position instead
+                    x_all  = np.linspace(0, x[-1] if len(x) else 1, len(x_all_raw))
+                    x_pred = np.linspace(0, x[-1] if len(x) else 1, len(x_pred_raw))
             elif x_label == 'session_idx':
-                x_all = np.arange(len(lr['soh_seq']), dtype=float)
+                x_all  = np.arange(len(lr['soh_seq']),  dtype=float)
                 x_pred = np.arange(len(lr['soh_pred']), dtype=float)
             else:
-                x_all = x_all_raw
+                x_all  = x_all_raw
                 x_pred = x_pred_raw
 
-            y_all = np.asarray(lr['soh_seq'], dtype=float)
+            y_all  = np.asarray(lr['soh_seq'],  dtype=float)
             y_pred = np.asarray(lr['soh_pred'], dtype=float)
-            y_all_plot = _smooth_line_until_soh_eol_for_plot(x_all, y_all, eol=SOH_EOL, window=9)
+            y_all_plot  = _smooth_line_until_soh_eol_for_plot(x_all,  y_all,  eol=SOH_EOL, window=9)
             y_pred_plot = _smooth_line_until_soh_eol_for_plot(x_pred, y_pred, eol=SOH_EOL, window=9)
 
             mask_all = np.isfinite(x_all) & np.isfinite(y_all_plot)
@@ -4320,12 +4457,19 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
                     ax.plot(xs[m], ys[m], 'g-', lw=2, label='LSTM trajectory')
 
             rul = rul_all.get(vid, {})
-            if (rul.get('phase2_slope', 0) < 0 and
-                np.isfinite(rul.get('hrlfc_now', np.nan)) and
-                np.isfinite(rul.get('rul_hrlfc_p50', np.nan))):
+            # Only draw tangent extrapolation when axis units match the model axis.
+            # When hrlfc_mid was used for fitting but the display is elapsed_days,
+            # hrlfc_now / rul_hrlfc_p50 are in wrong units for the display axis.
+            _axis_used = rul.get('axis_used', '')
+            _can_extrap = ((_axis_used == 'elapsed_days' and x_label == 'elapsed_days') or
+                           (_axis_used == 'hrlfc_mid'    and x_label == 'hrlfc_mid') or
+                           (_axis_used == 'session_idx'  and x_label == 'session_idx'))
+            if (_can_extrap and rul.get('phase2_slope', 0) < 0 and
+                    np.isfinite(rul.get('hrlfc_now', np.nan)) and
+                    np.isfinite(rul.get('rul_hrlfc_p50', np.nan))):
                 h_now = rul['hrlfc_now']
-                s = rul['phase2_slope']
-                b = rul['soh_now'] - s * h_now
+                s     = rul['phase2_slope']
+                b     = rul['soh_now'] - s * h_now
                 x_ext = np.linspace(h_now, h_now + rul.get('rul_hrlfc_p50', 0) * 1.2, 100)
                 y_ext = s * x_ext + b
                 y_ext_plot = _ease_curve_to_soh_eol_for_plot(y_ext, eol=SOH_EOL)
