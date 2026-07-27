@@ -4700,106 +4700,6 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
     print(f"  Customer vehicle cards -> {cards_dir}")
 
 
-def export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, save_path):
-    """
-    Export final outputs to CSV files.
-    """
-    # Always write to a fixed folder next to the script so reruns
-    # append/overwrite the same files regardless of cwd or plot_path.
-    out_dir = Path(__file__).resolve().parent / "soh_rul_results_exports"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) Fleet summary
-    summary_rows = []
-    for vid, r in rul_all.items():
-        summary_rows.append({
-            'vehicle_id': vid,
-            'soh_now_pct': r.get('soh_now', np.nan),
-            'init_capacity_ah': r.get('init_capacity_ah', np.nan),
-            'init_capacity_kwh': r.get('init_capacity_kwh', np.nan),
-            'current_capacity_ah': r.get('current_capacity_ah', np.nan),
-            'current_capacity_kwh': r.get('current_capacity_kwh', np.nan),
-            'eol_capacity_ah': r.get('eol_capacity_ah', np.nan),
-            'charging_events_count': r.get('charging_events_count', np.nan),
-            'equivalent_full_cycles': r.get('equivalent_full_cycles', np.nan),
-            'equivalent_full_cycles_epoch': r.get('equivalent_full_cycles_epoch', np.nan),
-            'pack_config_guess': r.get('pack_config_guess', ''),
-            'pack_score_confidence': r.get('pack_score_confidence', np.nan),
-            'pack_options_source': r.get('pack_options_source', ''),
-            'pack_series_cells': r.get('pack_series_cells', np.nan),
-            'pack_parallel_guess': r.get('pack_parallel_guess', np.nan),
-            'pack_voltage_ref_v': r.get('pack_voltage_ref_v', np.nan),
-            'pack_q_data_median_ah': r.get('pack_q_data_median_ah', np.nan),
-            'pack_q_data_count': r.get('pack_q_data_count', np.nan),
-            'pack_config_changed_strong': r.get('pack_config_changed_strong', False),
-            'config_epoch_id': r.get('config_epoch_id', 0),
-            'km_run_till_date': r.get('km_run_till_date', np.nan),
-            'km_to_eol_p10': r.get('km_to_eol_p10', np.nan),
-            'km_to_eol_p50': r.get('km_to_eol_p50', np.nan),
-            'km_to_eol_p90': r.get('km_to_eol_p90', np.nan),
-            'rul_days_p10': r.get('rul_days_p10', np.nan),
-            'rul_days_p50': r.get('rul_days_p50', np.nan),
-            'rul_days_p90': r.get('rul_days_p90', np.nan),
-            'energy_to_eol_kwh_p10': r.get('energy_to_eol_kwh_p10', np.nan),
-            'energy_to_eol_kwh_p50': r.get('energy_to_eol_kwh_p50', np.nan),
-            'energy_to_eol_kwh_p90': r.get('energy_to_eol_kwh_p90', np.nan),
-            'kwh_per_day_hist': r.get('kwh_per_day_hist', np.nan),
-            'deliverable_kwh_at_80_model': r.get('deliverable_kwh_at_80_model', np.nan),
-            'deliverable_kwh_at_80_nominal': r.get('deliverable_kwh_at_80_nominal', np.nan),
-            'phase2_slope_pct_per_axis': r.get('phase2_slope', np.nan),
-            'slope_basis': r.get('slope_basis', ''),
-            'last_seen_datetime_ist': r.get('last_seen_datetime_ist', pd.NaT),
-            'eol_date_p10_ist': r.get('eol_date_p10_ist', pd.NaT),
-            'eol_date_p50_ist': r.get('eol_date_p50_ist', pd.NaT),
-            'eol_date_p90_ist': r.get('eol_date_p90_ist', pd.NaT),
-            'bms_correction_factor': r.get('bms_correction_factor', 1.0),
-        })
-    summary_df = pd.DataFrame(summary_rows)
-    if not summary_df.empty and 'vehicle_id' in summary_df.columns:
-        summary_df = summary_df.sort_values('vehicle_id')
-    summary_df.to_csv(out_dir / "fleet_summary.csv", index=False)
-
-    # 2) Replacement events
-    if replacement_events is None:
-        replacement_events = pd.DataFrame()
-    replacement_events.to_csv(out_dir / "replacement_events.csv", index=False)
-
-    # 3) Session-level modeled data
-    sess_parts = []
-    for vid, res in xgb_results.items():
-        g = res['sessions'].copy()
-        g['vehicle_id'] = vid
-        sess_parts.append(g)
-    if sess_parts:
-        pd.concat(sess_parts, ignore_index=True).to_csv(out_dir / "session_predictions.csv", index=False)
-    else:
-        pd.DataFrame().to_csv(out_dir / "session_predictions.csv", index=False)
-
-    # 4) LSTM trajectory points
-    traj_parts = []
-    for vid, lr in lstm_results.items():
-        lb = int(lr.get('lookback', 0))
-        x_all = np.asarray(lr.get('hrlfc_seq', []), dtype=float)
-        y_all = np.asarray(lr.get('soh_seq', []), dtype=float)
-        y_pred = np.asarray(lr.get('soh_pred', []), dtype=float)
-        x_pred = x_all[lb:] if len(x_all) >= lb else np.array([], dtype=float)
-        n = min(len(x_pred), len(y_pred))
-        if n > 0:
-            traj_parts.append(pd.DataFrame({
-                'vehicle_id': vid,
-                'x_axis': x_pred[:n],
-                'soh_pred': y_pred[:n],
-            }))
-        if len(y_all) > 0:
-            traj_parts.append(pd.DataFrame({
-                'vehicle_id': vid,
-                'x_axis': x_all[:len(y_all)],
-                'soh_input': y_all,
-            }))
-    if traj_parts:
-        pd.concat(traj_parts, ignore_index=True).to_csv(out_dir / "lstm_trajectory.csv", index=False)
-    else:
-        pd.DataFrame().to_csv(out_dir / "lstm_trajectory.csv", index=False)
 
     print(f"\n  CSV exports -> {out_dir}")
 
@@ -4848,7 +4748,6 @@ def run_pipeline(
                 _print_summary_tables(rul_all, replacement_events)
                 plot_results(xgb_results, lstm_results, rul_all, plot_path)
                 plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
-                export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
                 return xgb_results, lstm_results, rul_all
         raise
 
@@ -5010,7 +4909,6 @@ def run_pipeline(
     _print_summary_tables(rul_all, replacement_events)
     plot_results(xgb_results, lstm_results, rul_all, plot_path)
     plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
-    export_results_csv(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
 
     # Always save state (full or inc) so the next inc run has correct sessions.
     # Compute per-vehicle watermarks from the raw data max utc.
