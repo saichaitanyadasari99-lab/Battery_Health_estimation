@@ -123,6 +123,8 @@ PACK_FIXED_BASELINE_AH = {
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
                                        # Keeps small-swing sessions (high SOC-rounding noise) out of training.
+AH_MODEL_MIN_SESSIONS       = 200      # Min charging sessions for reliable Ah-throughput RUL
+AH_MODEL_MIN_DAYS           = 365.0    # Min calendar days of history for reliable RUL
 RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
 RUL_TAIL_FRACTION           = 0.50    # Fraction of sessions used for WLS slope (recent half)
@@ -1909,8 +1911,14 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
             'Init_kWh': df_show['InitCap_100%_kWh'].apply(lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"),
             'Curr_kWh': df_show['CurrentCap_kWh'].apply(lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"),
             'Events': df_show['Charging_events'].apply(lambda v: f"{int(v)}" if np.isfinite(v) else "NA"),
-            'RUL_P50': df_show['RUL_P50_days'].astype(str),
-            'EOL_P50': df_show['EOL_date_P50'].astype(str),
+            'RUL_P50': [
+                'Trend building' if str(b) == 'monitoring_in_progress' else str(r)
+                for r, b in zip(df_show['RUL_P50_days'], df['SlopeBasis'])
+            ],
+            'EOL_P50': [
+                'Building...' if str(b) == 'monitoring_in_progress' else str(e)
+                for e, b in zip(df_show['EOL_date_P50'], df['SlopeBasis'])
+            ],
             'Slope': df_show['Slope_%/10k'].apply(lambda v: f"{v:.2f}" if np.isfinite(v) else "NA"),
             'Basis': df_show['SlopeBasis'].astype(str),
         })
@@ -4009,48 +4017,69 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 rul['soh_now'] = soh_now
 
         # ── Ah-throughput RUL override (365-day Ah/day window) ─────────────────
-        _ah        = _ah_model_fits.get(vid, {})
-        _ah_rate365 = _ah.get('rate_365d', np.nan)
-        _ah_rate90  = _ah.get('rate_90d',  np.nan)
-        _ah_to_eol  = _ah.get('ah_to_eol', np.nan)
-        _ah_r2      = _ah.get('r2',         np.nan)
-        _ah_alpha_v = _ah.get('alpha',      np.nan)
-        _sqrtt_p50  = rul.get('rul_days_p50', np.nan)
-        _ah_p50 = _ah_p10 = _ah_p90 = np.nan
-        _ah_basis = None
+        _span_ok = np.isfinite(days_span) and days_span >= AH_MODEL_MIN_DAYS
+        _sess_ok = len(g) >= AH_MODEL_MIN_SESSIONS
 
-        if (np.isfinite(_ah_r2) and _ah_r2 > 0.3
-                and np.isfinite(_ah_to_eol) and _ah_to_eol >= 0
-                and np.isfinite(_ah_rate365) and _ah_rate365 > 0):
-            _ah_p50 = _ah_to_eol / _ah_rate365
-            _ah_p10 = (_ah_to_eol / _ah_rate90) if np.isfinite(_ah_rate90) and _ah_rate90 > 0 else _ah_p50 * 0.75
-            _ah_p90 = _ah_p50 * 1.3
-            _ah_basis = 'ah_throughput_model'
-        elif (np.isfinite(_fleet_alpha) and _fleet_alpha > 0
-              and np.isfinite(_ah_rate365) and _ah_rate365 > 0
-              and np.isfinite(soh_now) and soh_now > SOH_EOL):
-            _s0_v = _ah.get('s0', np.nan)
-            if not np.isfinite(_s0_v):
-                _s0_v = min(soh_now + 5.0, 100.0)
-            if (_s0_v - soh_now) > 0:
-                _xn_f = ((_s0_v - soh_now) / _fleet_alpha) ** 2
-                _xe_f = ((_s0_v - SOH_EOL)  / _fleet_alpha) ** 2
-                _fleet_ah_eol = max(_xe_f - _xn_f, 0.0)
-                _ah_p50 = _fleet_ah_eol / _ah_rate365
-                _ah_p10 = (_fleet_ah_eol / _ah_rate90) if np.isfinite(_ah_rate90) and _ah_rate90 > 0 else _ah_p50 * 0.75
+        if not _span_ok or not _sess_ok:
+            # Insufficient history for a reliable RUL — suppress the number and
+            # surface a human-readable explanation instead.
+            _why_parts = []
+            if not _span_ok:
+                _mo_have = (days_span / 30.44) if np.isfinite(days_span) else 0.0
+                _why_parts.append(f"{_mo_have:.1f} mo < 12 mo")
+            if not _sess_ok:
+                _why_parts.append(f"{len(g)} sessions < {AH_MODEL_MIN_SESSIONS}")
+            _why_str = ', '.join(_why_parts)
+            rul['rul_days_p10']    = np.nan
+            rul['rul_days_p50']    = np.nan
+            rul['rul_days_p90']    = np.nan
+            rul['slope_basis']     = 'monitoring_in_progress'
+            rul['rul_status_note'] = f"Trend building — {_why_str}"
+            print(f"    [RUL] {vid}: trend building — {_why_str} "
+                  f"(need {AH_MODEL_MIN_SESSIONS}+ sessions & 12+ months)")
+        else:
+            _ah        = _ah_model_fits.get(vid, {})
+            _ah_rate365 = _ah.get('rate_365d', np.nan)
+            _ah_rate90  = _ah.get('rate_90d',  np.nan)
+            _ah_to_eol  = _ah.get('ah_to_eol', np.nan)
+            _ah_r2      = _ah.get('r2',         np.nan)
+            _ah_alpha_v = _ah.get('alpha',      np.nan)
+            _sqrtt_p50  = rul.get('rul_days_p50', np.nan)
+            _ah_p50 = _ah_p10 = _ah_p90 = np.nan
+            _ah_basis = None
+
+            if (np.isfinite(_ah_r2) and _ah_r2 > 0.3
+                    and np.isfinite(_ah_to_eol) and _ah_to_eol >= 0
+                    and np.isfinite(_ah_rate365) and _ah_rate365 > 0):
+                _ah_p50 = _ah_to_eol / _ah_rate365
+                _ah_p10 = (_ah_to_eol / _ah_rate90) if np.isfinite(_ah_rate90) and _ah_rate90 > 0 else _ah_p50 * 0.75
                 _ah_p90 = _ah_p50 * 1.3
-                _ah_basis = 'ah_throughput_fleet_alpha'
+                _ah_basis = 'ah_throughput_model'
+            elif (np.isfinite(_fleet_alpha) and _fleet_alpha > 0
+                  and np.isfinite(_ah_rate365) and _ah_rate365 > 0
+                  and np.isfinite(soh_now) and soh_now > SOH_EOL):
+                _s0_v = _ah.get('s0', np.nan)
+                if not np.isfinite(_s0_v):
+                    _s0_v = min(soh_now + 5.0, 100.0)
+                if (_s0_v - soh_now) > 0:
+                    _xn_f = ((_s0_v - soh_now) / _fleet_alpha) ** 2
+                    _xe_f = ((_s0_v - SOH_EOL)  / _fleet_alpha) ** 2
+                    _fleet_ah_eol = max(_xe_f - _xn_f, 0.0)
+                    _ah_p50 = _fleet_ah_eol / _ah_rate365
+                    _ah_p10 = (_fleet_ah_eol / _ah_rate90) if np.isfinite(_ah_rate90) and _ah_rate90 > 0 else _ah_p50 * 0.75
+                    _ah_p90 = _ah_p50 * 1.3
+                    _ah_basis = 'ah_throughput_fleet_alpha'
 
-        if np.isfinite(_ah_p50) and _ah_p50 >= 0:
-            _rul_cap_d = float(REPORT_RUL_CAP_DAYS)
-            _cap_d = lambda d: min(d, _rul_cap_d) if np.isfinite(d) else d
-            rul['rul_days_p10'] = _cap_d(_ah_p10)
-            rul['rul_days_p50'] = _cap_d(_ah_p50)
-            rul['rul_days_p90'] = _cap_d(_ah_p90)
-            rul['slope_basis']  = _ah_basis
-            print(f"    [Ah model] {vid}: R²={_ah_r2:.3f} alpha={_ah_alpha_v:.5f} "
-                  f"rate365={_ah_rate365:.1f} Ah/d  "
-                  f"RUL={_cap_d(_ah_p50):.0f}d (sqrt_t was {_sqrtt_p50:.0f}d)")
+            if np.isfinite(_ah_p50) and _ah_p50 >= 0:
+                _rul_cap_d = float(REPORT_RUL_CAP_DAYS)
+                _cap_d = lambda d: min(d, _rul_cap_d) if np.isfinite(d) else d
+                rul['rul_days_p10'] = _cap_d(_ah_p10)
+                rul['rul_days_p50'] = _cap_d(_ah_p50)
+                rul['rul_days_p90'] = _cap_d(_ah_p90)
+                rul['slope_basis']  = _ah_basis
+                print(f"    [Ah model] {vid}: R²={_ah_r2:.3f} alpha={_ah_alpha_v:.5f} "
+                      f"rate365={_ah_rate365:.1f} Ah/d  "
+                      f"RUL={_cap_d(_ah_p50):.0f}d (sqrt_t was {_sqrtt_p50:.0f}d)")
         # ───────────────────────────────────────────────────────────────────────
 
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
@@ -4150,28 +4179,35 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         print(f"Initial capacity: {_fmt_ah(rul.get('init_capacity_ah', np.nan))} ({_fmt_kwh(rul.get('init_capacity_kwh', np.nan))})")
         print(f"Capacity today  : {_fmt_ah(rul.get('current_capacity_ah', np.nan))} ({_fmt_kwh(rul.get('current_capacity_kwh', np.nan))})")
         print("")
-        print(
-            f"Expected life remaining : "
-            f"{_life_remaining_text(rul.get('rul_days_p50', np.nan), rul.get('rul_days_p10', np.nan), rul.get('rul_days_p90', np.nan))}"
-        )
-        print(
-            "Est. end-of-life date   : "
-            f"worst={_fmt_eol_date(rul.get('eol_date_p10_ist', pd.NaT), rul.get('rul_days_p10', np.nan))} | "
-            f"likely={_fmt_eol_date(rul.get('eol_date_p50_ist', pd.NaT), rul.get('rul_days_p50', np.nan))} | "
-            f"best={_fmt_eol_date(rul.get('eol_date_p90_ist', pd.NaT), rul.get('rul_days_p90', np.nan))}"
-        )
-        print(f"Distance covered        : {_fmt_km(rul.get('km_run_till_date', np.nan))}")
         _sb = rul.get('slope_basis', '')
-        _rel = _sb not in ('', 'already_at_eol') and 'floor_rate' not in _sb and 'insufficient' not in _sb
-        if _rel:
-            print(
-                "Distance remaining      : "
-                f"worst={_fmt_km(rul.get('km_to_eol_p10', np.nan), approx=True)} | "
-                f"likely={_fmt_km(rul.get('km_to_eol_p50', np.nan), approx=True)} | "
-                f"best={_fmt_km(rul.get('km_to_eol_p90', np.nan), approx=True)}"
-            )
+        if _sb == 'monitoring_in_progress':
+            _note = rul.get('rul_status_note', 'Trend building')
+            print(f"Expected life remaining : {_note}")
+            print(f"Est. end-of-life date   : Available after {AH_MODEL_MIN_SESSIONS}+ sessions & 12+ months of data")
+            print(f"Distance covered        : {_fmt_km(rul.get('km_run_till_date', np.nan))}")
+            print("Distance remaining      : N/A (trend building)")
         else:
-            print("Distance remaining      : N/A (insufficient trend data)")
+            print(
+                f"Expected life remaining : "
+                f"{_life_remaining_text(rul.get('rul_days_p50', np.nan), rul.get('rul_days_p10', np.nan), rul.get('rul_days_p90', np.nan))}"
+            )
+            print(
+                "Est. end-of-life date   : "
+                f"worst={_fmt_eol_date(rul.get('eol_date_p10_ist', pd.NaT), rul.get('rul_days_p10', np.nan))} | "
+                f"likely={_fmt_eol_date(rul.get('eol_date_p50_ist', pd.NaT), rul.get('rul_days_p50', np.nan))} | "
+                f"best={_fmt_eol_date(rul.get('eol_date_p90_ist', pd.NaT), rul.get('rul_days_p90', np.nan))}"
+            )
+            print(f"Distance covered        : {_fmt_km(rul.get('km_run_till_date', np.nan))}")
+            _rel = _sb not in ('', 'already_at_eol') and 'floor_rate' not in _sb and 'insufficient' not in _sb
+            if _rel:
+                print(
+                    "Distance remaining      : "
+                    f"worst={_fmt_km(rul.get('km_to_eol_p10', np.nan), approx=True)} | "
+                    f"likely={_fmt_km(rul.get('km_to_eol_p50', np.nan), approx=True)} | "
+                    f"best={_fmt_km(rul.get('km_to_eol_p90', np.nan), approx=True)}"
+                )
+            else:
+                print("Distance remaining      : N/A (insufficient trend data)")
 
     return rul_all
 
@@ -4810,20 +4846,27 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
         ax2.text(0.03, 0.82, f"Battery Health  : {rr.get('soh_now', np.nan):.2f}%" if np.isfinite(rr.get('soh_now', np.nan)) else "Battery Health  : NA", fontsize=11.5)
         ax2.text(0.03, 0.74, f"Initial capacity: {_fmt_ah(rr.get('init_capacity_ah', np.nan))} ({_fmt_kwh(rr.get('init_capacity_kwh', np.nan))})", fontsize=10.5)
         ax2.text(0.03, 0.66, f"Capacity today  : {_fmt_ah(rr.get('current_capacity_ah', np.nan))} ({_fmt_kwh(rr.get('current_capacity_kwh', np.nan))})", fontsize=10.5)
-        ax2.text(
-            0.03, 0.57,
-            f"Expected life remaining : {_life_remaining_text(rr.get('rul_days_p50', np.nan), rr.get('rul_days_p10', np.nan), rr.get('rul_days_p90', np.nan))}",
-            fontsize=10.2
-        )
-        ax2.text(0.03, 0.48, f"Est. end-of-life date   : {_fmt_eol_date(rr.get('eol_date_p50_ist', pd.NaT), rr.get('rul_days_p50', np.nan))}", fontsize=10.2)
-        ax2.text(0.03, 0.39, f"Distance covered        : {_fmt_km(rr.get('km_run_till_date', np.nan))}", fontsize=10.2)
         _slope_basis = rr.get('slope_basis', '')
-        _reliable_slope = _slope_basis not in ('', 'already_at_eol') and 'floor_rate' not in _slope_basis and 'insufficient' not in _slope_basis
-        _dist_rem_text = (
-            f"likely={_fmt_km(rr.get('km_to_eol_p50', np.nan), approx=True)}"
-            if _reliable_slope else "N/A (insufficient trend data)"
-        )
-        ax2.text(0.03, 0.30, f"Distance remaining      : {_dist_rem_text}", fontsize=10.2)
+        if _slope_basis == 'monitoring_in_progress':
+            _card_note = rr.get('rul_status_note', 'Trend building')
+            ax2.text(0.03, 0.57, f"Expected life remaining : {_card_note}", fontsize=10.2)
+            ax2.text(0.03, 0.48, f"Est. end-of-life date   : Available after {AH_MODEL_MIN_SESSIONS}+ sessions & 12+ months", fontsize=10.2)
+            ax2.text(0.03, 0.39, f"Distance covered        : {_fmt_km(rr.get('km_run_till_date', np.nan))}", fontsize=10.2)
+            ax2.text(0.03, 0.30, "Distance remaining      : N/A (trend building)", fontsize=10.2)
+        else:
+            ax2.text(
+                0.03, 0.57,
+                f"Expected life remaining : {_life_remaining_text(rr.get('rul_days_p50', np.nan), rr.get('rul_days_p10', np.nan), rr.get('rul_days_p90', np.nan))}",
+                fontsize=10.2
+            )
+            ax2.text(0.03, 0.48, f"Est. end-of-life date   : {_fmt_eol_date(rr.get('eol_date_p50_ist', pd.NaT), rr.get('rul_days_p50', np.nan))}", fontsize=10.2)
+            ax2.text(0.03, 0.39, f"Distance covered        : {_fmt_km(rr.get('km_run_till_date', np.nan))}", fontsize=10.2)
+            _reliable_slope = _slope_basis not in ('', 'already_at_eol') and 'floor_rate' not in _slope_basis and 'insufficient' not in _slope_basis
+            _dist_rem_text = (
+                f"likely={_fmt_km(rr.get('km_to_eol_p50', np.nan), approx=True)}"
+                if _reliable_slope else "N/A (insufficient trend data)"
+            )
+            ax2.text(0.03, 0.30, f"Distance remaining      : {_dist_rem_text}", fontsize=10.2)
         ax2.text(0.03, 0.20, f"Cycles (equiv full)     : {rr.get('equivalent_full_cycles', np.nan):.0f}" if np.isfinite(rr.get('equivalent_full_cycles', np.nan)) else "Cycles (equiv full)     : NA", fontsize=9.8)
         ax2.text(0.03, 0.12, f"Partial charging events : {int(rr.get('partial_charging_events_count', 0))}" if np.isfinite(rr.get('partial_charging_events_count', np.nan)) else "Partial charging events : NA", fontsize=9.8)
         ax2.text(0.03, 0.06, f"Risk: {risk}", color=risk_color, fontsize=10.5, fontweight='bold')
