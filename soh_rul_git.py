@@ -125,9 +125,6 @@ SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contrib
                                        # Keeps small-swing sessions (high SOC-rounding noise) out of training.
 AH_MODEL_MIN_SESSIONS       = 100      # Min charging sessions for reliable Ah-throughput RUL
 AH_MODEL_MIN_DAYS           = 90.0     # Min calendar days of history for reliable RUL
-RUL_DAMPING_WEIGHT_NEW      = 0.7      # Weight for new RUL when blending on significant change
-RUL_DAMPING_WEIGHT_PREV     = 0.3      # Weight for previous RUL when blending
-RUL_DAMPING_THRESHOLD_PCT   = 5.0      # % change below which RUL holds previous value (noise gate)
 RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
 RUL_TAIL_FRACTION           = 0.50    # Fraction of sessions used for WLS slope (recent half)
@@ -3613,24 +3610,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
     _ah_model_fits = {}
     for _vid, _res in xgb_results.items():
         _sc = 'soh_display' if 'soh_display' in _res['sessions'].columns else 'soh_xgb'
-        _g_ah = _res['sessions'].copy()
-        # Inject LSTM smoothed SOH when available — reduces noise in curve fit
-        _lr = (lstm_results or {}).get(_vid, {})
-        if isinstance(_lr, dict) and len(_lr.get('soh_pred', [])) > 0:
-            _sort_col = _lr.get('sort_col', 'hrlfc_mid')
-            _lb = int(_lr.get('lookback', 10))
-            _soh_pred = np.asarray(_lr['soh_pred'], dtype=float)
-            if _sort_col in _g_ah.columns:
-                _g_ah = _g_ah.sort_values(_sort_col).reset_index(drop=True)
-            else:
-                _g_ah = _g_ah.reset_index(drop=True)
-            _soh_lstm = _g_ah[_sc].values.astype(float).copy()
-            _n_pred = min(len(_soh_pred), len(_g_ah) - _lb)
-            if _n_pred > 0 and _lb < len(_g_ah):
-                _soh_lstm[_lb:_lb + _n_pred] = _soh_pred[:_n_pred]
-            _g_ah['soh_lstm'] = _soh_lstm
-            _sc = 'soh_lstm'
-        _ah_model_fits[_vid] = _fit_ah_model_for_rul(_g_ah, soh_col=_sc)
+        _ah_model_fits[_vid] = _fit_ah_model_for_rul(_res['sessions'], soh_col=_sc)
     _good_alphas = [d['alpha'] for d in _ah_model_fits.values()
                     if np.isfinite(d.get('alpha', np.nan))
                     and d.get('r2', 0) > 0.3 and d.get('alpha', 0) > 0.001]
@@ -3919,32 +3899,6 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 print(f"    [Ah model] {vid}: R²={_ah_r2:.3f} alpha={_ah_alpha_v:.5f} "
                       f"rate365={_ah_rate365:.1f} Ah/d  "
                       f"RUL={_cap_d(_ah_p50):.0f}d (sqrt_t was {_sqrtt_p50:.0f}d)")
-        # ── RUL carry-forward damping — suppress noise between incremental runs ──
-        if rul.get('slope_basis') not in ('monitoring_in_progress', None):
-            _prev_p50 = float(pd.to_numeric(
-                pd.Series([prev_rr.get('rul_days_p50', np.nan)]), errors='coerce').iloc[0])
-            _new_p50 = rul.get('rul_days_p50', np.nan)
-            if np.isfinite(_prev_p50) and np.isfinite(_new_p50) and _prev_p50 > 0:
-                _change_pct = abs(_new_p50 - _prev_p50) / _prev_p50 * 100.0
-                _pctl_pairs = [('rul_days_p10', 'rul_days_p10'),
-                               ('rul_days_p50', 'rul_days_p50'),
-                               ('rul_days_p90', 'rul_days_p90')]
-                if _change_pct <= RUL_DAMPING_THRESHOLD_PCT:
-                    for _nk, _pk in _pctl_pairs:
-                        _pv = float(pd.to_numeric(
-                            pd.Series([prev_rr.get(_pk, np.nan)]), errors='coerce').iloc[0])
-                        if np.isfinite(_pv):
-                            rul[_nk] = _pv
-                    print(f"    [RUL damping] {vid}: Δ{_change_pct:.1f}% < {RUL_DAMPING_THRESHOLD_PCT}% — holding prev RUL")
-                else:
-                    for _nk, _pk in _pctl_pairs:
-                        _pv = float(pd.to_numeric(
-                            pd.Series([prev_rr.get(_pk, np.nan)]), errors='coerce').iloc[0])
-                        _nv = rul.get(_nk, np.nan)
-                        if np.isfinite(_pv) and np.isfinite(_nv):
-                            rul[_nk] = RUL_DAMPING_WEIGHT_NEW * _nv + RUL_DAMPING_WEIGHT_PREV * _pv
-                    print(f"    [RUL damping] {vid}: Δ{_change_pct:.1f}% — blended "
-                          f"{int(RUL_DAMPING_WEIGHT_NEW*100)}% new + {int(RUL_DAMPING_WEIGHT_PREV*100)}% prev")
         # ───────────────────────────────────────────────────────────────────────
 
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
