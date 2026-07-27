@@ -1505,107 +1505,118 @@ def _utc_to_ist_datetime(utc_num):
     return pd.to_datetime(float(utc_num) + 946684800 + 19800, unit='s', origin='unix', errors='coerce')
 
 
-def detect_battery_replacements(xgb_results: dict) -> pd.DataFrame:
+def _scan_replacement_events(g: pd.DataFrame) -> list:
     """
-    Detect likely battery replacement events from positive capacity/SOH jumps
-    with persistence checks. Does not use hrlfc resets as a primary signal.
+    Sliding-window replacement scan on a pre-sorted sessions dataframe.
+    Returns a list of raw event dicts for every candidate found.
+    Shared by detect_battery_replacements and _find_replacement_epoch.
     """
-    events = []
     w = int(REPL_WINDOW)
     m = int(REPL_PERSIST_M)
     k = int(REPL_PERSIST_K)
+    n = len(g)
+    if n < 2 * w + 3:
+        return []
 
-    for vid, res in xgb_results.items():
-        g = res['sessions'].copy()
-        if len(g) < (2 * w + 3):
+    q = _finite_series(g['implied_Q_Ah']) if 'implied_Q_Ah' in g.columns else pd.Series(np.nan, index=g.index)
+    if 'soh_label' in g.columns:
+        soh = _finite_series(g['soh_label'])
+    elif 'soh_xgb' in g.columns:
+        soh = _finite_series(g['soh_xgb'])
+    else:
+        soh = pd.Series(np.nan, index=g.index)
+
+    events = []
+    i = w
+    while i < n - w - 1:
+        pre_q   = float(np.nanmedian(q.iloc[i - w:i]))   if q.iloc[i - w:i].notna().any()   else np.nan
+        post_q  = float(np.nanmedian(q.iloc[i+1:i+1+w])) if q.iloc[i+1:i+1+w].notna().any() else np.nan
+        pre_soh = float(np.nanmedian(soh.iloc[i - w:i]))   if soh.iloc[i - w:i].notna().any()   else np.nan
+        post_soh= float(np.nanmedian(soh.iloc[i+1:i+1+w])) if soh.iloc[i+1:i+1+w].notna().any() else np.nan
+
+        q_jump_ah  = (post_q  - pre_q)  if np.isfinite(pre_q)  and np.isfinite(post_q)  else np.nan
+        q_jump_pct = (100.0 * q_jump_ah / pre_q) if np.isfinite(q_jump_ah) and pre_q > 0 else np.nan
+        soh_jump   = (post_soh - pre_soh) if np.isfinite(pre_soh) and np.isfinite(post_soh) else np.nan
+
+        cond_q   = np.isfinite(q_jump_pct) and np.isfinite(q_jump_ah) and q_jump_pct >= REPL_Q_JUMP_PCT and q_jump_ah >= REPL_Q_JUMP_AH
+        cond_soh = np.isfinite(soh_jump) and soh_jump >= REPL_SOH_JUMP_PCT
+        if not (cond_q or cond_soh):
+            i += 1
             continue
 
+        end = min(n, i + 1 + m)
+        next_q, next_soh = q.iloc[i+1:end], soh.iloc[i+1:end]
+        q_thresh   = pre_q   * (1.0 + 0.6 * REPL_Q_JUMP_PCT / 100.0) if np.isfinite(pre_q)   else np.nan
+        soh_thresh = pre_soh + 0.6 * REPL_SOH_JUMP_PCT                if np.isfinite(pre_soh) else np.nan
+        keep_q   = np.isfinite(q_thresh)   and int((next_q   >= q_thresh  ).sum()) >= k
+        keep_soh = np.isfinite(soh_thresh) and int((next_soh >= soh_thresh).sum()) >= k
+        if not (keep_q or keep_soh):
+            i += 1
+            continue
+
+        q_score    = min(1.0, (min(1.0, q_jump_pct / max(REPL_Q_JUMP_PCT, 1e-9)) + min(1.0, q_jump_ah / max(REPL_Q_JUMP_AH, 1e-9))) / 2.0) if np.isfinite(q_jump_pct) else 0.0
+        soh_score  = min(1.0, max(0.0, soh_jump / max(REPL_SOH_JUMP_PCT, 1e-9))) if np.isfinite(soh_jump) else 0.0
+        pers_score = min(1.0, max(
+            int((next_q   >= q_thresh  ).sum()) if np.isfinite(q_thresh)   else 0,
+            int((next_soh >= soh_thresh).sum()) if np.isfinite(soh_thresh) else 0,
+        ) / max(k, 1))
+        conf = 0.45 * q_score + 0.35 * soh_score + 0.20 * pers_score
+
+        events.append({
+            'pos': i + 1,
+            'conf': conf,
+            'q_jump_ah': q_jump_ah, 'q_jump_pct': q_jump_pct,
+            'soh_jump': soh_jump,
+            'pre_q': pre_q, 'post_q': post_q,
+            'pre_soh': pre_soh, 'post_soh': post_soh,
+            'q_thresh': q_thresh, 'soh_thresh': soh_thresh,
+            'next_q': next_q, 'next_soh': next_soh,
+        })
+        i += w
+
+    return events
+
+
+def detect_battery_replacements(xgb_results: dict) -> pd.DataFrame:
+    """Detect likely battery replacement events across all vehicles."""
+    rows = []
+    for vid, res in xgb_results.items():
+        g = res['sessions'].copy()
+        if len(g) < (2 * int(REPL_WINDOW) + 3):
+            continue
         if 'start_utc' in g.columns and _finite_series(g['start_utc']).notna().sum() >= max(5, int(0.6 * len(g))):
             g = g.sort_values('start_utc').reset_index(drop=True)
         else:
             sort_col = _pick_axis_col(g)
             if sort_col == '__session_idx':
-                g = g.copy()
                 g['__session_idx'] = np.arange(len(g), dtype=float)
             g = g.sort_values(sort_col).reset_index(drop=True)
 
-        q = _finite_series(g['implied_Q_Ah']) if 'implied_Q_Ah' in g.columns else pd.Series(np.nan, index=g.index)
-        soh = _finite_series(g['soh_label']) if 'soh_label' in g.columns else _finite_series(g.get('soh_xgb', pd.Series(np.nan, index=g.index)))
-
-        i = w
-        while i < len(g) - w - 1:
-            pre_q = float(np.nanmedian(q.iloc[i - w:i])) if np.isfinite(np.nanmedian(q.iloc[i - w:i])) else np.nan
-            post_q = float(np.nanmedian(q.iloc[i + 1:i + 1 + w])) if np.isfinite(np.nanmedian(q.iloc[i + 1:i + 1 + w])) else np.nan
-            pre_soh = float(np.nanmedian(soh.iloc[i - w:i])) if np.isfinite(np.nanmedian(soh.iloc[i - w:i])) else np.nan
-            post_soh = float(np.nanmedian(soh.iloc[i + 1:i + 1 + w])) if np.isfinite(np.nanmedian(soh.iloc[i + 1:i + 1 + w])) else np.nan
-
-            q_jump_ah = (post_q - pre_q) if np.isfinite(pre_q) and np.isfinite(post_q) else np.nan
-            q_jump_pct = (100.0 * q_jump_ah / pre_q) if np.isfinite(q_jump_ah) and np.isfinite(pre_q) and pre_q > 0 else np.nan
-            soh_jump = (post_soh - pre_soh) if np.isfinite(pre_soh) and np.isfinite(post_soh) else np.nan
-
-            cond_q = np.isfinite(q_jump_pct) and np.isfinite(q_jump_ah) and (q_jump_pct >= REPL_Q_JUMP_PCT) and (q_jump_ah >= REPL_Q_JUMP_AH)
-            cond_soh = np.isfinite(soh_jump) and (soh_jump >= REPL_SOH_JUMP_PCT)
-            if not (cond_q or cond_soh):
-                i += 1
-                continue
-
-            end = min(len(g), i + 1 + m)
-            next_q = q.iloc[i + 1:end]
-            next_soh = soh.iloc[i + 1:end]
-
-            q_thresh = pre_q * (1.0 + 0.6 * REPL_Q_JUMP_PCT / 100.0) if np.isfinite(pre_q) else np.nan
-            soh_thresh = pre_soh + 0.6 * REPL_SOH_JUMP_PCT if np.isfinite(pre_soh) else np.nan
-            keep_q = np.isfinite(q_thresh) and int((next_q >= q_thresh).sum()) >= k
-            keep_soh = np.isfinite(soh_thresh) and int((next_soh >= soh_thresh).sum()) >= k
-
-            if not (keep_q or keep_soh):
-                i += 1
-                continue
-
-            event_row = g.iloc[i + 1]
-            utc_ev    = float(event_row['start_utc'])   if ('start_utc'  in g.columns and np.isfinite(pd.to_numeric(event_row['start_utc'],  errors='coerce'))) else np.nan
-            hrlfc_ev  = float(event_row['hrlfc_mid'])   if ('hrlfc_mid'  in g.columns and np.isfinite(pd.to_numeric(event_row['hrlfc_mid'],  errors='coerce'))) else np.nan
-            dt_ev = _utc_to_ist_datetime(utc_ev)
-
-            q_score = 0.0
-            if np.isfinite(q_jump_pct):
-                q_score += min(1.0, q_jump_pct / max(REPL_Q_JUMP_PCT, 1e-9))
-            if np.isfinite(q_jump_ah):
-                q_score += min(1.0, q_jump_ah / max(REPL_Q_JUMP_AH, 1e-9))
-            q_score = min(1.0, q_score / 2.0)
-            soh_score = min(1.0, max(0.0, soh_jump / max(REPL_SOH_JUMP_PCT, 1e-9))) if np.isfinite(soh_jump) else 0.0
-            pers_score = min(1.0, max(int((next_q >= q_thresh).sum()) if np.isfinite(q_thresh) else 0,
-                                      int((next_soh >= soh_thresh).sum()) if np.isfinite(soh_thresh) else 0) / max(k, 1))
-            conf = 0.45 * q_score + 0.35 * soh_score + 0.20 * pers_score
-
-            events.append({
+        for ev in _scan_replacement_events(g):
+            event_row = g.iloc[ev['pos']]
+            utc_ev   = float(event_row['start_utc']) if ('start_utc' in g.columns and np.isfinite(pd.to_numeric(event_row['start_utc'], errors='coerce'))) else np.nan
+            hrlfc_ev = float(event_row['hrlfc_mid']) if ('hrlfc_mid' in g.columns and np.isfinite(pd.to_numeric(event_row['hrlfc_mid'], errors='coerce'))) else np.nan
+            rows.append({
                 'vehicle_id': vid,
-                'event_session_idx': int(i + 1),
+                'event_session_idx': ev['pos'],
                 'event_utc': utc_ev,
                 'event_session_utc': utc_ev,
-                'event_hrlfc_mid': hrlfc_ev,  # anchor for cross-sort lookup in compute_all_rul
-                'event_datetime_ist': dt_ev,
-                'pre_q_ah': pre_q,
-                'post_q_ah': post_q,
-                'q_jump_ah': q_jump_ah,
-                'q_jump_pct': q_jump_pct,
-                'pre_soh_pct': pre_soh,
-                'post_soh_pct': post_soh,
-                'soh_jump_pct': soh_jump,
-                'confidence': float(conf),
+                'event_hrlfc_mid': hrlfc_ev,
+                'event_datetime_ist': _utc_to_ist_datetime(utc_ev),
+                'pre_q_ah': ev['pre_q'], 'post_q_ah': ev['post_q'],
+                'q_jump_ah': ev['q_jump_ah'], 'q_jump_pct': ev['q_jump_pct'],
+                'pre_soh_pct': ev['pre_soh'], 'post_soh_pct': ev['post_soh'],
+                'soh_jump_pct': ev['soh_jump'],
+                'confidence': float(ev['conf']),
             })
 
-            i += w
-
-    if not events:
+    if not rows:
         return pd.DataFrame(columns=[
             'vehicle_id', 'event_session_idx', 'event_utc', 'event_datetime_ist',
             'pre_q_ah', 'post_q_ah', 'q_jump_ah', 'q_jump_pct',
-            'pre_soh_pct', 'post_soh_pct', 'soh_jump_pct', 'confidence'
+            'pre_soh_pct', 'post_soh_pct', 'soh_jump_pct', 'confidence',
         ])
-
-    ev = pd.DataFrame(events).sort_values(['vehicle_id', 'event_session_idx']).reset_index(drop=True)
-    return ev
+    return pd.DataFrame(rows).sort_values(['vehicle_id', 'event_session_idx']).reset_index(drop=True)
 
 
 def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
@@ -3516,62 +3527,14 @@ def extrapolate_rul(hrlfc_seq, soh_seq, hrlfc_to_days,
 def _find_replacement_epoch(g: pd.DataFrame,
                              min_soh_jump: float = 5.0,
                              min_conf: float = 0.95) -> int | None:
-    """
-    Run replacement detection on an already-sorted session dataframe and return
-    the position (integer index into g) of the best replacement event, or None.
-    Uses identical window-median logic as detect_battery_replacements so the
-    result maps directly onto hrlfc_seq / soh_seq built from the same g.
-    """
-    w = int(REPL_WINDOW)
-    m = int(REPL_PERSIST_M)
-    k = int(REPL_PERSIST_K)
-    n = len(g)
-    if n < 2 * w + 3:
+    """Return position of the best-confidence replacement event in g, or None."""
+    candidates = [
+        ev for ev in _scan_replacement_events(g)
+        if ev['conf'] >= min_conf and np.isfinite(ev['soh_jump']) and ev['soh_jump'] >= min_soh_jump
+    ]
+    if not candidates:
         return None
-
-    q   = _finite_series(g['implied_Q_Ah']) if 'implied_Q_Ah' in g.columns else pd.Series(np.nan, index=g.index)
-    soh = _finite_series(g['soh_label'])    if 'soh_label'   in g.columns else pd.Series(np.nan, index=g.index)
-
-    best_pos, best_conf = None, -1.0
-    i = w
-    while i < n - w - 1:
-        pre_q   = float(np.nanmedian(q.iloc[i - w:i]))   if q.iloc[i - w:i].notna().any()   else np.nan
-        post_q  = float(np.nanmedian(q.iloc[i+1:i+1+w])) if q.iloc[i+1:i+1+w].notna().any() else np.nan
-        pre_soh = float(np.nanmedian(soh.iloc[i - w:i]))   if soh.iloc[i - w:i].notna().any()   else np.nan
-        post_soh= float(np.nanmedian(soh.iloc[i+1:i+1+w])) if soh.iloc[i+1:i+1+w].notna().any() else np.nan
-
-        q_jump_ah  = (post_q  - pre_q)  if np.isfinite(pre_q)  and np.isfinite(post_q)  else np.nan
-        q_jump_pct = (100.0 * q_jump_ah / pre_q) if np.isfinite(q_jump_ah) and pre_q > 0 else np.nan
-        soh_jump   = (post_soh - pre_soh) if np.isfinite(pre_soh) and np.isfinite(post_soh) else np.nan
-
-        cond_q   = np.isfinite(q_jump_pct) and np.isfinite(q_jump_ah) and q_jump_pct >= REPL_Q_JUMP_PCT and q_jump_ah >= REPL_Q_JUMP_AH
-        cond_soh = np.isfinite(soh_jump)   and soh_jump >= REPL_SOH_JUMP_PCT
-        if not (cond_q or cond_soh):
-            i += 1
-            continue
-
-        end    = min(n, i + 1 + m)
-        next_q = q.iloc[i+1:end];  next_soh = soh.iloc[i+1:end]
-        q_thresh   = pre_q   * (1.0 + 0.6 * REPL_Q_JUMP_PCT / 100.0) if np.isfinite(pre_q)   else np.nan
-        soh_thresh = pre_soh + 0.6 * REPL_SOH_JUMP_PCT                if np.isfinite(pre_soh) else np.nan
-        keep_q   = np.isfinite(q_thresh)   and int((next_q   >= q_thresh  ).sum()) >= k
-        keep_soh = np.isfinite(soh_thresh) and int((next_soh >= soh_thresh).sum()) >= k
-        if not (keep_q or keep_soh):
-            i += 1
-            continue
-
-        q_score   = min(1.0, (min(1.0, q_jump_pct / max(REPL_Q_JUMP_PCT, 1e-9)) + min(1.0, q_jump_ah / max(REPL_Q_JUMP_AH, 1e-9))) / 2.0) if np.isfinite(q_jump_pct) else 0.0
-        soh_score = min(1.0, max(0.0, soh_jump / max(REPL_SOH_JUMP_PCT, 1e-9))) if np.isfinite(soh_jump) else 0.0
-        pers_score= min(1.0, max(int((next_q >= q_thresh).sum()) if np.isfinite(q_thresh) else 0,
-                                 int((next_soh >= soh_thresh).sum()) if np.isfinite(soh_thresh) else 0) / max(k, 1))
-        conf = 0.45 * q_score + 0.35 * soh_score + 0.20 * pers_score
-
-        if conf >= min_conf and np.isfinite(soh_jump) and soh_jump >= min_soh_jump and conf > best_conf:
-            best_pos, best_conf = i + 1, conf
-
-        i += w
-
-    return best_pos
+    return max(candidates, key=lambda e: e['conf'])['pos']
 
 
 
@@ -3873,7 +3836,6 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 rul['soh_now'] = soh_now
 
         # ── Ah-throughput RUL override (365-day Ah/day window) ─────────────────
-        print(f"    [Ah guard] {vid}: days_span={days_span:.0f}d  sessions={len(g)}")
         _span_ok = np.isfinite(days_span) and days_span >= AH_MODEL_MIN_DAYS
         _sess_ok = len(g) >= AH_MODEL_MIN_SESSIONS
 
