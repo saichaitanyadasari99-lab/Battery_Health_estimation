@@ -2354,7 +2354,12 @@ def load_and_clean(path: str, since_utc: float = None, overlap_sec: float = 0.0)
     # Fall back to chargingCurrent (charger-side; aux subtraction applied later).
     if 'charge_calc' not in df.columns:
         if 'NetBatteryCurrentHiRes' in df.columns:
-            df['charge_calc'] = (df['NetBatteryCurrentHiRes'].abs() * df['dt_sec']) / 3600.0
+            _nbch = pd.to_numeric(df['NetBatteryCurrentHiRes'], errors='coerce')
+            _curr_abs = _nbch.abs()
+            if 'chargingCurrent' in df.columns:
+                _cc_abs = pd.to_numeric(df['chargingCurrent'], errors='coerce').abs()
+                _curr_abs = _curr_abs.where(_nbch.notna(), _cc_abs)
+            df['charge_calc'] = (_curr_abs * df['dt_sec']) / 3600.0
         elif 'chargingCurrent' in df.columns:
             df['charge_calc'] = (df['chargingCurrent'].abs() * df['dt_sec']) / 3600.0
 
@@ -2538,7 +2543,12 @@ def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
 
     if 'charge_calc' not in chg.columns:
         if 'NetBatteryCurrentHiRes' in chg.columns and 'dt_sec' in chg.columns:
-            chg['charge_calc'] = (chg['NetBatteryCurrentHiRes'].abs() * chg['dt_sec']) / 3600.0
+            _nbch = pd.to_numeric(chg['NetBatteryCurrentHiRes'], errors='coerce')
+            _curr_abs = _nbch.abs()
+            if 'chargingCurrent' in chg.columns:
+                _cc_abs = pd.to_numeric(chg['chargingCurrent'], errors='coerce').abs()
+                _curr_abs = _curr_abs.where(_nbch.notna(), _cc_abs)
+            chg['charge_calc'] = (_curr_abs * chg['dt_sec']) / 3600.0
         elif {'chargingCurrent', 'dt_sec'}.issubset(chg.columns):
             chg['charge_calc'] = (chg['chargingCurrent'].abs() * chg['dt_sec']) / 3600.0
 
