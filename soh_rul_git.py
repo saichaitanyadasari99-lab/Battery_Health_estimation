@@ -3859,6 +3859,8 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             _eff_days_span = days_span
 
         # ── Ah-throughput RUL override (365-day Ah/day window) ─────────────────
+        print(f"    [RUL guard] {vid}: raw_span={days_span:.1f}d  eff_span={_eff_days_span:.1f}d  "
+              f"raw_rows={len(raw_v)}  len_g={len(g)}  total_sess={_total_sessions}")
         _span_ok = np.isfinite(_eff_days_span) and _eff_days_span >= AH_MODEL_MIN_DAYS
         _sess_ok = _total_sessions >= AH_MODEL_MIN_SESSIONS
 
