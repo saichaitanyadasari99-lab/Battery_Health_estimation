@@ -360,7 +360,7 @@ def _load_pipeline_state(state_dir: Path):
     if not pkls:
         return None
 
-    all_sessions, watermarks, init_cap_map, pack_ctx_map = [], {}, {}, {}
+    all_sessions, watermarks, init_cap_map, pack_ctx_map, rul_map = [], {}, {}, {}, {}
     for pkl_path in pkls:
         try:
             v = pd.read_pickle(pkl_path)
@@ -380,6 +380,9 @@ def _load_pipeline_state(state_dir: Path):
             ctx = v.get('pack_context')
             if isinstance(ctx, dict):
                 pack_ctx_map[vid] = ctx
+            rul = v.get('rul', {})
+            if isinstance(rul, dict) and rul:
+                rul_map[vid] = rul
         except Exception as e:
             print(f"    [WARN] Could not load {pkl_path.name}: {e}")
 
@@ -395,13 +398,14 @@ def _load_pipeline_state(state_dir: Path):
         'watermarks'       : watermarks,       # {vid: last_utc_num}
         'init_capacity_map': init_cap_map,
         'pack_context_map' : pack_ctx_map,
-        # legacy keys — empty so old code paths that check these don't crash
-        'xgb_results': {}, 'lstm_results': {}, 'rul_all': {}, 'replacement_events': pd.DataFrame(),
+        # legacy keys — xgb/lstm not stored in pkl; rul_all rebuilt from per-vehicle rul
+        'xgb_results': {}, 'lstm_results': {}, 'rul_all': rul_map, 'replacement_events': pd.DataFrame(),
     }
 
 
 def _save_pipeline_state(state_dir: Path, sessions: pd.DataFrame,
-                          watermarks: dict, init_cap_map: dict, pack_ctx_map: dict):
+                          watermarks: dict, init_cap_map: dict, pack_ctx_map: dict,
+                          rul_all: dict = None):
     """Save one pkl per vehicle containing only essentials."""
     state_dir.mkdir(parents=True, exist_ok=True)
     if not isinstance(sessions, pd.DataFrame) or 'vehicle_id' not in sessions.columns:
@@ -416,6 +420,7 @@ def _save_pipeline_state(state_dir: Path, sessions: pd.DataFrame,
             'sessions'       : grp.reset_index(drop=True),
             'init_capacity_ah': init_cap_map.get(vid_str, np.nan),
             'pack_context'   : pack_ctx_map.get(vid_str, {}),
+            'rul'            : (rul_all or {}).get(vid_str, {}),
         }
         try:
             pd.to_pickle(v_state, state_dir / f"{vid_str}_state.pkl")
@@ -4850,15 +4855,21 @@ def run_pipeline(
         cached_pack_ctx = _extract_cached_pack_context_map(cached_rul)
 
     if incremental and since_utc is not None and len(sessions_new) == 0:
-        # No new sessions — recompute from cached sessions (xgb/rul not stored in pkl).
-        print("    No new charging sessions after watermark. Recomputing from cached sessions.")
-        labeled      = compute_soh_labels(sessions, init_capacity_overrides=cached_init_map, prior_pack_context=cached_pack_ctx)
-        xgb_results        = train_xgboost_soh(labeled)
-        lstm_results       = train_lstm_trajectory(xgb_results, lookback=10)
-        replacement_events = detect_battery_replacements(xgb_results)
-        rul_all            = compute_all_rul(xgb_results, lstm_results, df_raw,
-                                             prev_rul_all=cached_rul,
-                                             replacement_events=replacement_events)
+        if cached_rul:
+            # Cached RUL available — show tables directly, no recompute needed.
+            print("    No new charging sessions. Showing cached results.")
+            _print_summary_tables(cached_rul, cached_repl)
+            return {}, {}, cached_rul
+        else:
+            # No cached RUL (old pkl format without rul) — recompute from stored sessions.
+            print("    No new charging sessions. Recomputing from stored sessions (upgrading state).")
+            labeled      = compute_soh_labels(sessions, init_capacity_overrides=cached_init_map, prior_pack_context=cached_pack_ctx)
+            xgb_results        = train_xgboost_soh(labeled)
+            lstm_results       = train_lstm_trajectory(xgb_results, lookback=10)
+            replacement_events = detect_battery_replacements(xgb_results)
+            rul_all            = compute_all_rul(xgb_results, lstm_results, df_raw,
+                                                 prev_rul_all=cached_rul,
+                                                 replacement_events=replacement_events)
 
     elif incremental and since_utc is not None and len(sessions_new) > 0:
         touched = set(sessions_new['vehicle_id'].dropna().tolist()) if 'vehicle_id' in sessions_new.columns else set()
@@ -4962,7 +4973,7 @@ def run_pipeline(
         }
         new_pack_ctx[str(vid)] = ctx
 
-    _save_pipeline_state(state_file, sessions, new_watermarks, new_init_map, new_pack_ctx)
+    _save_pipeline_state(state_file, sessions, new_watermarks, new_init_map, new_pack_ctx, rul_all=rul_all)
 
     return xgb_results, lstm_results, rul_all
 
