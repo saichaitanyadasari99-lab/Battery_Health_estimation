@@ -3835,19 +3835,42 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 rul = extrapolate_rul(_rr_ax[_rr_ok], _rr_soh[_rr_ok], htd)
                 rul['soh_now'] = soh_now
 
+        # Cumulative span/session count — survive across incremental runs where g
+        # contains only new/delta sessions rather than the full vehicle history.
+        _prev_first_utc = float(pd.to_numeric(
+            pd.Series([prev_rr.get('first_session_utc', np.nan)]), errors='coerce').iloc[0])
+        _curr_first_utc = np.nan
+        if 'start_utc' in g.columns:
+            _su = _finite_series(g['start_utc'])
+            if _su.notna().sum() >= 1:
+                _curr_first_utc = float(_su.min())
+        if np.isfinite(_prev_first_utc) and np.isfinite(_curr_first_utc):
+            _first_session_utc = min(_prev_first_utc, _curr_first_utc)
+        elif np.isfinite(_prev_first_utc):
+            _first_session_utc = _prev_first_utc
+        else:
+            _first_session_utc = _curr_first_utc
+        _prev_total_sess = int(pd.to_numeric(
+            pd.Series([prev_rr.get('total_sessions_cumulative', 0)]), errors='coerce').fillna(0).iloc[0])
+        _total_sessions = max(len(g), _prev_total_sess)
+        if np.isfinite(_first_session_utc) and np.isfinite(last_utc) and last_utc > _first_session_utc:
+            _eff_days_span = (last_utc - _first_session_utc) / 86400.0
+        else:
+            _eff_days_span = days_span
+
         # ── Ah-throughput RUL override (365-day Ah/day window) ─────────────────
-        _span_ok = np.isfinite(days_span) and days_span >= AH_MODEL_MIN_DAYS
-        _sess_ok = len(g) >= AH_MODEL_MIN_SESSIONS
+        _span_ok = np.isfinite(_eff_days_span) and _eff_days_span >= AH_MODEL_MIN_DAYS
+        _sess_ok = _total_sessions >= AH_MODEL_MIN_SESSIONS
 
         if not _span_ok or not _sess_ok:
             # Insufficient history for a reliable RUL — suppress the number and
             # surface a human-readable explanation instead.
             _why_parts = []
             if not _span_ok:
-                _mo_have = (days_span / 30.44) if np.isfinite(days_span) else 0.0
+                _mo_have = (_eff_days_span / 30.44) if np.isfinite(_eff_days_span) else 0.0
                 _why_parts.append(f"{_mo_have:.1f} mo < 12 mo")
             if not _sess_ok:
-                _why_parts.append(f"{len(g)} sessions < {AH_MODEL_MIN_SESSIONS}")
+                _why_parts.append(f"{_total_sessions} sessions < {AH_MODEL_MIN_SESSIONS}")
             _why_str = ', '.join(_why_parts)
             rul['rul_days_p10']    = np.nan
             rul['rul_days_p50']    = np.nan
@@ -3940,6 +3963,8 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             'vehicle_id': vid,
             'hrlfc_to_days': htd,
             'n_sessions': len(g),
+            'total_sessions_cumulative': _total_sessions,
+            'first_session_utc': _first_session_utc if np.isfinite(_first_session_utc) else np.nan,
             'data_span_days': days_span if np.isfinite(days_span) else np.nan,
             'axis_used': axis_name,
             'q_base_for_soh_ah': q_base_ah,
