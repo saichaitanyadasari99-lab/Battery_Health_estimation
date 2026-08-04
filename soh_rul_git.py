@@ -123,7 +123,7 @@ PACK_FIXED_BASELINE_AH = {
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
                                        # Keeps small-swing sessions (high SOC-rounding noise) out of training.
-AH_MODEL_MIN_SESSIONS       = 100      # Min charging sessions for reliable Ah-throughput RUL
+AH_MODEL_MIN_SESSIONS       = 200      # Min charging sessions for reliable Ah-throughput RUL
 AH_MODEL_MIN_DAYS           = 180.0    # Min calendar days of history for reliable RUL
 RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
@@ -1797,7 +1797,7 @@ def _print_summary_tables(rul_all: dict, replacement_events: pd.DataFrame):
             'Curr_kWh': df_show['CurrentCap_kWh'].apply(lambda v: f"{v:.1f}" if np.isfinite(v) else "NA"),
             'Events': df_show['Charging_events'].apply(lambda v: f"{int(v)}" if np.isfinite(v) else "NA"),
             'RUL_P50': [
-                'Trend building' if str(b) == 'monitoring_in_progress' else str(r)
+                'New vehicle' if str(b) == 'monitoring_in_progress' else str(r)
                 for r, b in zip(df_show['RUL_P50_days'], df['SlopeBasis'])
             ],
             'EOL_P50': [
@@ -3891,8 +3891,12 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             rul['rul_days_p50']    = np.nan
             rul['rul_days_p90']    = np.nan
             rul['slope_basis']     = 'monitoring_in_progress'
-            rul['rul_status_note'] = f"Trend building — {_why_str}"
-            print(f"    [RUL] {vid}: trend building — {_why_str} "
+            _mo_so_far = (_eff_days_span / 30.44) if np.isfinite(_eff_days_span) else 0.0
+            rul['rul_status_note'] = (
+                f"New vehicle — SOH ~100%, collecting baseline data "
+                f"({_total_sessions} sessions, {_mo_so_far:.1f} months so far)"
+            )
+            print(f"    [RUL] {vid}: new vehicle — {_why_str} "
                   f"(need {AH_MODEL_MIN_SESSIONS}+ sessions & 6+ months)")
         else:
             _ah        = _ah_model_fits.get(vid, {})
@@ -4042,7 +4046,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
         if _sb == 'monitoring_in_progress':
             _note = rul.get('rul_status_note', 'Trend building')
             print(f"Expected life remaining : {_note}")
-            print(f"Est. end-of-life date   : Available after {AH_MODEL_MIN_SESSIONS}+ sessions & 6+ months of data")
+            print(f"Est. end-of-life date   : Available after {AH_MODEL_MIN_SESSIONS}+ sessions & 6+ months of history")
             print(f"Distance covered        : {_fmt_km(rul.get('km_run_till_date', np.nan))}")
             print("Distance remaining      : N/A (trend building)")
         else:
@@ -4709,7 +4713,7 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
         if _slope_basis == 'monitoring_in_progress':
             _card_note = rr.get('rul_status_note', 'Trend building')
             ax2.text(0.03, 0.57, f"Expected life remaining : {_card_note}", fontsize=10.2)
-            ax2.text(0.03, 0.48, f"Est. end-of-life date   : Available after {AH_MODEL_MIN_SESSIONS}+ sessions & 6+ months", fontsize=10.2)
+            ax2.text(0.03, 0.48, f"Est. end-of-life date   : Available after {AH_MODEL_MIN_SESSIONS}+ sessions & 6+ months of history", fontsize=10.2)
             ax2.text(0.03, 0.39, f"Distance covered        : {_fmt_km(rr.get('km_run_till_date', np.nan))}", fontsize=10.2)
             ax2.text(0.03, 0.30, "Distance remaining      : N/A (trend building)", fontsize=10.2)
         else:
