@@ -61,7 +61,7 @@ warnings.filterwarnings('ignore')
 SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
-EXPECTED_CAPACITY_OPTIONS_AH = (104.5, 153.0, 306.0, 612.0)  # Fleet pack capacities
+EXPECTED_CAPACITY_OPTIONS_AH = (103.5, 153.0, 306.0, 612.0)  # Fleet pack capacities
 REPORT_RUL_CAP_DAYS = 2922.0          # RUL reporting horizon cap (days) — 96 months
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
@@ -95,8 +95,8 @@ CELL_VOLT_MIN = 2.8                  # Cell minimum voltage (V)
 CELL_VOLT_MAX = 3.6                  # Cell maximum voltage (V)
 CELL_VOLT_NOM = 3.2                  # Cell nominal voltage (V) for series estimation
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
-    96: (104.5,),
-    120: (104.5,),
+    96: (103.5,),
+    120: (103.5,),
     208: (153.0, 306.0, 612.0),      # 208s1p / 208s2p / 208s4p
 }
 PACK_CLASSIFY_W_SERIES = 0.45
@@ -114,8 +114,8 @@ PACK_USABLE_FRACTION = 1.00          # Usable fraction applied to nominal pack c
 BMS_CALIBRATION_ENABLED = True        # Scale implied_Q_Ah by per-vehicle BMS/MY ratio when BMS columns present
 BMS_INIT_CAP_OVERRIDE   = True        # Use BMS initial capacity as q_base when bms_init_cap column present
 PACK_FIXED_BASELINE_AH = {
-    '96s1p': 104.5,
-    '120s1p': 104.5,
+    '96s1p': 103.5,
+    '120s1p': 103.5,
     '208s1p': 153.0,
     '208s2p': 306.0,
     '208s4p': 612.0,
@@ -124,7 +124,7 @@ SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contrib
                                        # Sessions below this are NaN'd and interpolated from neighbours.
                                        # Keeps small-swing sessions (high SOC-rounding noise) out of training.
 AH_MODEL_MIN_SESSIONS       = 100      # Min charging sessions for reliable Ah-throughput RUL
-AH_MODEL_MIN_DAYS           = 90.0     # Min calendar days of history for reliable RUL
+AH_MODEL_MIN_DAYS           = 180.0    # Min calendar days of history for reliable RUL
 RUL_MIN_NEG_SLOPE           = -1e-6    # Min negative slope treated as degrading
 RUL_SLOPE_DISPLAY_AXIS_SCALE = 10000.0  # Show slope as % per 10k axis units
 RUL_TAIL_FRACTION           = 0.50    # Fraction of sessions used for WLS slope (recent half)
@@ -186,7 +186,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 153.0, 306.0, 612.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.8,
         'SOFT_MIN_DROP_LSTM': 0.8,
@@ -198,7 +198,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 2.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 153.0, 306.0, 612.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.6,
         'SOFT_MIN_DROP_LSTM': 0.6,
@@ -210,7 +210,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 0.5,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [104.5, 153.0, 306.0, 612.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 1.0,
         'SOFT_MIN_DROP_LSTM': 1.0,
@@ -1177,8 +1177,8 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     q_evidence = q_data_med if np.isfinite(q_data_med) else (float(q_anchor) if np.isfinite(q_anchor) and (float(q_anchor) > 0) else np.nan)
 
     candidates = [
-        {'series': 96, 'parallel': 1, 'nom_ah': 104.5},
-        {'series': 120, 'parallel': 1, 'nom_ah': 104.5},
+        {'series': 96, 'parallel': 1, 'nom_ah': 103.5},
+        {'series': 120, 'parallel': 1, 'nom_ah': 103.5},
         {'series': 208, 'parallel': 1, 'nom_ah': 153.0},
         {'series': 208, 'parallel': 2, 'nom_ah': 306.0},
         {'series': 208, 'parallel': 4, 'nom_ah': 612.0},
@@ -3883,7 +3883,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             _why_parts = []
             if not _span_ok:
                 _mo_have = (_eff_days_span / 30.44) if np.isfinite(_eff_days_span) else 0.0
-                _why_parts.append(f"{_mo_have:.1f} mo < 12 mo")
+                _why_parts.append(f"{_mo_have:.1f} mo < 6 mo")
             if not _sess_ok:
                 _why_parts.append(f"{_total_sessions} sessions < {AH_MODEL_MIN_SESSIONS}")
             _why_str = ', '.join(_why_parts)
