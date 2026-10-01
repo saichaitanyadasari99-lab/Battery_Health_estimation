@@ -61,7 +61,7 @@ warnings.filterwarnings('ignore')
 SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
-EXPECTED_CAPACITY_OPTIONS_AH = (103.5, 153.0, 306.0, 612.0)  # Fleet pack capacities
+EXPECTED_CAPACITY_OPTIONS_AH = (103.5, 161.0, 322.0, 644.0)  # Fleet pack capacities (208-series calibrated from 4 VECV physical SOH measurements: median q_new=322 Ah)
 REPORT_RUL_CAP_DAYS = 2922.0          # RUL reporting horizon cap (days) — 96 months
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
@@ -79,7 +79,7 @@ REPL_SOH_JUMP_PCT   = 10.0            # Replacement detection: SOH jump %
 # ------------------------------------------------------------------------------
 # INTERNAL DEFAULTS (normally do not edit)
 # ------------------------------------------------------------------------------
-Q_RATED_AH    = 304.0                 # Fallback nominal capacity floor
+Q_RATED_AH    = 322.0                 # Fallback nominal capacity floor (calibrated to 208s2p fleet)
 MAX_TAIL_STRIP = 2                    # Tail-drop correction strips
 SOFT_MIN_DROP_LABEL = 0.4             # Min total drop on smoothed pseudo-label
 INIT_CAPACITY_CYCLES = 25             # Auto-estimate init capacity from first N charging sessions
@@ -97,7 +97,7 @@ CELL_VOLT_NOM = 3.2                  # Cell nominal voltage (V) for series estim
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
     96: (103.5,),
     120: (103.5,),
-    208: (153.0, 306.0, 612.0),      # 208s1p / 208s2p / 208s4p
+    208: (161.0, 322.0, 644.0),      # 208s1p / 208s2p / 208s4p (calibrated)
 }
 PACK_CLASSIFY_W_SERIES = 0.45
 PACK_CLASSIFY_W_VOLT = 0.20
@@ -114,11 +114,11 @@ PACK_USABLE_FRACTION = 1.00          # Usable fraction applied to nominal pack c
 BMS_CALIBRATION_ENABLED = True        # Scale implied_Q_Ah by per-vehicle BMS/MY ratio when BMS columns present
 BMS_INIT_CAP_OVERRIDE   = True        # Use BMS initial capacity as q_base when bms_init_cap column present
 PACK_FIXED_BASELINE_AH = {
-    '96s1p': 103.5,
+    '96s1p':  103.5,
     '120s1p': 103.5,
-    '208s1p': 153.0,
-    '208s2p': 306.0,
-    '208s4p': 612.0,
+    '208s1p': 161.0,   # calibrated: 322 / 2
+    '208s2p': 322.0,   # calibrated from 4 VECV physical SOH measurements (median back-calc q_new)
+    '208s4p': 644.0,   # calibrated: 322 * 2
 }
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
@@ -186,7 +186,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 161.0, 322.0, 644.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.8,
         'SOFT_MIN_DROP_LSTM': 0.8,
@@ -198,7 +198,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 2.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 161.0, 322.0, 644.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.6,
         'SOFT_MIN_DROP_LSTM': 0.6,
@@ -210,7 +210,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 0.5,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 161.0, 322.0, 644.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 1.0,
         'SOFT_MIN_DROP_LSTM': 1.0,
@@ -479,7 +479,7 @@ def _parse_pack_config_guess(cfg_text: str):
 def _capacity_options_from_pack_config(cfg_text: str):
     s_cells, p_count = _parse_pack_config_guess(cfg_text)
     if np.isfinite(s_cells) and np.isfinite(p_count) and int(s_cells) == 208:
-        return (304.0,) if int(p_count) >= 2 else (152.0,)
+        return (322.0,) if int(p_count) >= 2 else (161.0,)
     if np.isfinite(s_cells):
         return tuple(float(v) for v in PACK_CAPACITY_OPTIONS_BY_SERIES.get(int(s_cells), EXPECTED_CAPACITY_OPTIONS_AH))
     return tuple(float(v) for v in EXPECTED_CAPACITY_OPTIONS_AH)
@@ -1179,9 +1179,9 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     candidates = [
         {'series': 96, 'parallel': 1, 'nom_ah': 103.5},
         {'series': 120, 'parallel': 1, 'nom_ah': 103.5},
-        {'series': 208, 'parallel': 1, 'nom_ah': 153.0},
-        {'series': 208, 'parallel': 2, 'nom_ah': 306.0},
-        {'series': 208, 'parallel': 4, 'nom_ah': 612.0},
+        {'series': 208, 'parallel': 1, 'nom_ah': 161.0},
+        {'series': 208, 'parallel': 2, 'nom_ah': 322.0},
+        {'series': 208, 'parallel': 4, 'nom_ah': 644.0},
     ]
     scored = []
     for cand in candidates:
@@ -1238,13 +1238,13 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     chosen_series_pre = int(chosen['series'])
     if chosen_series_pre == 208 and q_q_count >= 8 and np.isfinite(q_data_med):
         if q_data_med >= float(PACK_208_FORCE_4P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 612.0}
+            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 644.0}
             options_source = 'force_208_4p_from_q'
         elif q_data_med >= float(PACK_208_FORCE_2P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 306.0}
+            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 322.0}
             options_source = 'force_208_2p_from_q'
         elif q_data_med <= float(PACK_208_FORCE_1P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 153.0}
+            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 161.0}
             options_source = 'force_208_1p_from_q'
 
     chosen_series = int(chosen['series'])
@@ -2764,8 +2764,8 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.DataFrame:
             if chg:
                 _q_pre  = float(roll_q_prev.iloc[_i]) if np.isfinite(roll_q_prev.iloc[_i]) else np.nan
                 _q_post = float(roll_q.iloc[_i])      if np.isfinite(roll_q.iloc[_i])      else np.nan
-                _s_old  = _q_pre  / (p * 153.0) if np.isfinite(_q_pre)  else np.nan
-                _s_new  = _q_post / (p * 153.0) if np.isfinite(_q_post) else np.nan
+                _s_old  = _q_pre  / (p * 161.0) if np.isfinite(_q_pre)  else np.nan
+                _s_new  = _q_post / (p * 161.0) if np.isfinite(_q_post) else np.nan
                 _n_est  = round(jfrac * p * _s_old / (_s_new - _s_old)) \
                           if (np.isfinite(_s_old) and np.isfinite(_s_new)
                               and (_s_new - _s_old) > 0.01) else '?'
