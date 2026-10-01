@@ -109,7 +109,7 @@ PACK_208_FORCE_4P_Q_THRESHOLD_AH = 400.0
 PACK_208_FORCE_2P_Q_THRESHOLD_AH = 170.0
 PACK_208_FORCE_1P_Q_THRESHOLD_AH = 160.0
 BASELINE_MAX_DRIFT_PCT = 5.0         # Per-run cap on baseline drift unless replacement signal is strong
-STRICT_PACK_BASELINE_ENABLED = True   # Force baseline capacity from inferred pack config
+STRICT_PACK_BASELINE_ENABLED = False  # Let pipeline anchor to measured initial capacity; nominal overestimates real-world pack delivery
 PACK_USABLE_FRACTION = 1.00          # Usable fraction applied to nominal pack capacity
 BMS_CALIBRATION_ENABLED = True        # Scale implied_Q_Ah by per-vehicle BMS/MY ratio when BMS columns present
 BMS_INIT_CAP_OVERRIDE   = True        # Use BMS initial capacity as q_base when bms_init_cap column present
@@ -4744,6 +4744,394 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
     print(f"  Customer vehicle cards -> {cards_dir}")
 
 
+def _generate_html_report(xgb_results, rul_all, plot_path):
+    """Generate a self-contained HTML fleet health report from pipeline results."""
+    import json, datetime as _dt
+
+    def _sf(v, d=1):
+        try:
+            f = float(v)
+            return None if not np.isfinite(f) else round(f, d)
+        except Exception:
+            return None
+
+    def _si(v):
+        try:
+            f = float(v)
+            return None if not np.isfinite(f) else int(round(f))
+        except Exception:
+            return None
+
+    def _fmtd(v):
+        try:
+            s = str(v)
+            if s in ('nan', 'NaT', 'None', '', 'NaTType'):
+                return None
+            import re as _re
+            m = _re.match(r'(\d{4}-\d{2}-\d{2})', s)
+            return m.group(1) if m else (s[:10] if len(s) >= 10 else s)
+        except Exception:
+            return None
+
+    vehicles = []
+    for vid in sorted(rul_all.keys()):
+        rr = rul_all[vid]
+
+        soh_history = []
+        if vid in xgb_results and isinstance(xgb_results[vid], dict):
+            g = xgb_results[vid].get('sessions', pd.DataFrame())
+            if len(g) > 0:
+                soh_col = next((c for c in ['soh_display', 'soh_xgb', 'soh_smooth'] if c in g.columns), None)
+                if soh_col and 'start_utc' in g.columns:
+                    sv = pd.to_numeric(g['start_utc'], errors='coerce').values.astype(float)
+                    yv = pd.to_numeric(g[soh_col], errors='coerce').values.astype(float)
+                    fin = np.isfinite(sv) & np.isfinite(yv)
+                    if np.any(fin):
+                        t0 = float(np.nanmin(sv[fin]))
+                        soh_history = [
+                            [round((float(si) - t0) / 86400.0, 1), round(float(yi), 2)]
+                            for si, yi in zip(sv[fin], yv[fin])
+                        ]
+
+        slope_basis = str(rr.get('slope_basis', '') or '')
+        soh_now = _sf(rr.get('soh_now'))
+        rul_p50 = _sf(rr.get('rul_days_p50'), 0)
+        rul_p10 = _sf(rr.get('rul_days_p10'), 0)
+        rul_p90 = _sf(rr.get('rul_days_p90'), 0)
+        has_rul = (slope_basis != 'monitoring_in_progress'
+                   and rul_p50 is not None and rul_p50 > 0)
+
+        if soh_now is None:
+            risk = 'unknown'
+        elif soh_now < 82 or (rul_p50 is not None and rul_p50 < 180):
+            risk = 'high'
+        elif soh_now < 88 or (rul_p50 is not None and rul_p50 < 365):
+            risk = 'watch'
+        else:
+            risk = 'healthy'
+
+        vehicles.append({
+            'id': str(vid),
+            'soh_now': soh_now,
+            'rul_p10': rul_p10,
+            'rul_p50': rul_p50,
+            'rul_p90': rul_p90,
+            'eol_p10': _fmtd(rr.get('eol_date_p10_ist')),
+            'eol_p50': _fmtd(rr.get('eol_date_p50_ist')),
+            'eol_p90': _fmtd(rr.get('eol_date_p90_ist')),
+            'current_kwh': _sf(rr.get('current_capacity_kwh')),
+            'init_kwh': _sf(rr.get('init_capacity_kwh')),
+            'cycles': _si(rr.get('equivalent_full_cycles')),
+            'km': _si(rr.get('km_run_till_date')),
+            'sessions': _si(rr.get('n_sessions')) or 0,
+            'data_span_days': _sf(rr.get('data_span_days'), 1),
+            'slope_basis': slope_basis,
+            'has_rul': has_rul,
+            'risk': risk,
+            'status_note': str(rr.get('rul_status_note', '') or ''),
+            'last_seen': _fmtd(rr.get('last_seen_datetime_ist')) or '',
+            'soh_history': soh_history,
+        })
+
+    data_json = json.dumps(vehicles, ensure_ascii=False)
+    gen_at = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    _HTML_JS = r"""
+const EOL_SOH = 70;
+
+function fmtN(v, d) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  return Number(v).toLocaleString('en-IN', {minimumFractionDigits: d||0, maximumFractionDigits: d||0});
+}
+function fmtDays(d) {
+  if (d === null || d === undefined) return '—';
+  if (d >= 365) return (d / 365).toFixed(1) + ' yr';
+  return Math.round(d) + ' d';
+}
+function riskClass(r) {
+  return {high: 'risk-high', watch: 'risk-watch', healthy: 'risk-ok', unknown: 'risk-unk'}[r] || 'risk-unk';
+}
+function riskLabel(r) {
+  return {high: 'High risk', watch: 'Watch', healthy: 'Healthy', unknown: 'New vehicle'}[r] || '—';
+}
+
+function drawChart(v) {
+  const W = 680, H = 250, pL = 44, pR = 16, pT = 16, pB = 32;
+  const hist = v.soh_history || [];
+  const dataSpan = v.data_span_days || (hist.length ? hist[hist.length-1][0] : 365);
+  let xMax = dataSpan;
+  if (v.has_rul && v.rul_p90) xMax = dataSpan + v.rul_p90 * 1.15;
+  xMax = Math.max(xMax, dataSpan * 1.25, 180);
+  const yMin = 64, yMax = 103;
+  const X = t => pL + (t / xMax) * (W - pL - pR);
+  const Y = s => pT + ((yMax - s) / (yMax - yMin)) * (H - pT - pB);
+
+  // grid
+  let grid = '';
+  for (const yv of [70, 80, 90, 100]) {
+    grid += `<line x1="${pL}" x2="${W-pR}" y1="${Y(yv).toFixed(1)}" y2="${Y(yv).toFixed(1)}" stroke="#D3DBE6" stroke-width="1"/>`;
+    grid += `<text class="ax" x="${pL-8}" y="${(Y(yv)+3.5).toFixed(1)}" text-anchor="end">${yv}%</text>`;
+  }
+  // x axis labels (months)
+  const mo_step = xMax <= 400 ? 60 : xMax <= 800 ? 120 : 180;
+  for (let t = 0; t <= xMax + 1; t += mo_step) {
+    grid += `<text class="ax" x="${X(t).toFixed(1)}" y="${H - pB + 18}" text-anchor="middle">${Math.round(t/30)}mo</text>`;
+  }
+
+  // EOL line
+  const eolLine = `<line x1="${pL}" x2="${W-pR}" y1="${Y(EOL_SOH).toFixed(1)}" y2="${Y(EOL_SOH).toFixed(1)}" stroke="#C2410C" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text class="ax eol-lbl" x="${(W-pR)}" y="${(Y(EOL_SOH)-6).toFixed(1)}" text-anchor="end">END OF LIFE</text>`;
+
+  // projection + uncertainty cone
+  let band = '', proj = '';
+  if (v.has_rul && v.rul_p50 && v.soh_now !== null) {
+    const t0 = dataSpan;
+    const drop = v.soh_now - EOL_SOH;
+    const steps = 60;
+    const projPts = [], hiPts = [], loPts = [];
+    for (let i = 0; i <= steps; i++) {
+      const dt = (v.rul_p50 * 1.05) * i / steps;
+      const t = t0 + dt;
+      const s = v.soh_now - drop * Math.sqrt(dt / v.rul_p50);
+      if (s < EOL_SOH - 1.5) break;
+      projPts.push(`${X(t).toFixed(1)},${Y(s).toFixed(1)}`);
+      if (v.rul_p10) {
+        const sLo = v.soh_now - drop * Math.sqrt(dt / v.rul_p10);
+        loPts.push(`${X(t).toFixed(1)},${Y(sLo).toFixed(1)}`);
+      }
+      if (v.rul_p90) {
+        const sHi = v.soh_now - drop * Math.sqrt(dt / v.rul_p90);
+        hiPts.push(`${X(t).toFixed(1)},${Y(sHi).toFixed(1)}`);
+      }
+    }
+    if (projPts.length > 1)
+      proj = `<polyline points="${projPts.join(' ')}" fill="none" stroke="#1F4FD8" stroke-width="2" stroke-dasharray="4 5" stroke-linecap="round"/>`;
+    if (hiPts.length > 1 && loPts.length > 1)
+      band = `<polygon points="${hiPts.join(' ')} ${[...loPts].reverse().join(' ')}" fill="#A9BEDC" fill-opacity="0.35"/>`;
+  }
+
+  // history
+  let histLine = '';
+  if (hist.length > 1) {
+    const pts = hist.map(([d,s]) => `${X(d).toFixed(1)},${Y(s).toFixed(1)}`).join(' ');
+    histLine = `<polyline points="${pts}" fill="none" stroke="#1F4FD8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`;
+  }
+
+  // today marker
+  const todayX = X(dataSpan).toFixed(1);
+  const todayY = v.soh_now !== null ? Y(v.soh_now).toFixed(1) : Y(90).toFixed(1);
+  const todayMarker = `<line x1="${todayX}" x2="${todayX}" y1="${pT}" y2="${H-pB}" stroke="#0F1B2D" stroke-width="1" stroke-opacity=".25"/>
+    <circle cx="${todayX}" cy="${todayY}" r="5" fill="#1F4FD8" stroke="#fff" stroke-width="2"/>
+    <text class="ax" x="${(parseFloat(todayX)+8).toFixed(1)}" y="${(pT+12).toFixed(1)}" fill="#0F1B2D">TODAY</text>`;
+
+  return `<svg viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:auto;">`
+    + grid + eolLine + band + proj + histLine + todayMarker
+    + '</svg>';
+}
+
+function renderCard(v) {
+  const soh = v.soh_now !== null ? v.soh_now.toFixed(1) + '%' : '—';
+  const kwh = v.current_kwh !== null ? v.current_kwh.toFixed(1) + ' kWh' : '—';
+  const initKwh = v.init_kwh ? v.init_kwh.toFixed(1) : '?';
+  const rul = v.has_rul && v.rul_p50 ? fmtDays(v.rul_p50) : 'New vehicle';
+  const eol = v.eol_p50 || '—';
+  const note = v.status_note || '';
+  const chart = drawChart(v);
+
+  const rul_range = (v.has_rul && v.rul_p10 && v.rul_p90)
+    ? `<span class="sub-note">${fmtDays(v.rul_p10)} – ${fmtDays(v.rul_p90)} range</span>`
+    : '';
+
+  return `<div class="vcard" id="card-${CSS.escape(v.id)}">
+  <div class="vcard-head">
+    <div>
+      <span class="eyebrow">Vehicle</span>
+      <div class="vid">${v.id}</div>
+    </div>
+    <span class="risk-pill ${riskClass(v.risk)}">${riskLabel(v.risk)}</span>
+  </div>
+  <div class="chart-wrap">${chart}</div>
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="eyebrow">SOH today</div>
+      <div class="stat-big">${soh}</div>
+      <div class="stat-note">${kwh} usable · was ${initKwh} kWh</div>
+    </div>
+    <div class="stat-box">
+      <div class="eyebrow">Life remaining</div>
+      <div class="stat-big">${rul}</div>
+      <div class="stat-note">${v.has_rul ? ('EOL ~' + eol) : 'Collecting baseline data'} ${rul_range}</div>
+    </div>
+    <div class="stat-box">
+      <div class="eyebrow">Equiv. full cycles</div>
+      <div class="stat-big">${fmtN(v.cycles)}</div>
+      <div class="stat-note">${v.data_span_days ? Math.round(v.data_span_days/30.44) + ' months of data' : ''}</div>
+    </div>
+    <div class="stat-box">
+      <div class="eyebrow">Distance run</div>
+      <div class="stat-big">${v.km ? fmtN(Math.round(v.km/1000)) + ' k km' : '—'}</div>
+      <div class="stat-note">${fmtN(v.sessions)} charging sessions</div>
+    </div>
+  </div>
+  ${note ? `<div class="status-note">${note}</div>` : ''}
+  <div class="vcard-foot">Last seen ${v.last_seen || '—'}</div>
+</div>`;
+}
+
+function renderTable(vehicles) {
+  const rows = vehicles.map(v => {
+    const soh = v.soh_now !== null ? v.soh_now.toFixed(1) + '%' : '—';
+    const rul = v.has_rul && v.rul_p50 ? fmtDays(v.rul_p50) : '—';
+    const eol = v.eol_p50 || '—';
+    return `<tr onclick="scrollToCard('${v.id}')" style="cursor:pointer">
+      <td class="td-id">${v.id}</td>
+      <td class="td-soh ${riskClass(v.risk)}">${soh}</td>
+      <td>${v.current_kwh !== null ? v.current_kwh.toFixed(1) + ' kWh' : '—'}</td>
+      <td>${rul}</td>
+      <td>${eol}</td>
+      <td>${fmtN(v.cycles)}</td>
+      <td>${fmtN(v.sessions)}</td>
+      <td><span class="risk-pill ${riskClass(v.risk)}">${riskLabel(v.risk)}</span></td>
+    </tr>`;
+  }).join('');
+  return `<div class="table-wrap">
+  <table class="fleet-table">
+    <thead><tr>
+      <th>Vehicle</th><th>SOH</th><th>Capacity</th>
+      <th>Life left</th><th>Est. EOL</th>
+      <th>Cycles</th><th>Sessions</th><th>Status</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function scrollToCard(id) {
+  const el = document.getElementById('card-' + id);
+  if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+function init() {
+  const healthy = VEHICLES.filter(v => v.risk === 'healthy').length;
+  const watch = VEHICLES.filter(v => v.risk === 'watch').length;
+  const high = VEHICLES.filter(v => v.risk === 'high').length;
+  const newv = VEHICLES.filter(v => v.risk === 'unknown').length;
+
+  const summaryBadges = `
+    <span class="badge badge-ok">${healthy} healthy</span>
+    <span class="badge badge-watch">${watch} watch</span>
+    <span class="badge badge-high">${high} high risk</span>
+    ${newv ? `<span class="badge badge-unk">${newv} new</span>` : ''}
+  `;
+
+  document.getElementById('root').innerHTML = `
+    <div class="wrap">
+      <div class="page-head">
+        <div>
+          <div class="eyebrow">EV Fleet</div>
+          <h1>Battery Health Report</h1>
+        </div>
+        <div class="head-right">
+          <div class="summary-badges">${summaryBadges}</div>
+          <div class="gen-at">Generated ${GENERATED_AT}</div>
+        </div>
+      </div>
+      <h2 class="section-title">Fleet Overview</h2>
+      ${renderTable(VEHICLES)}
+      <h2 class="section-title" style="margin-top:36px">Vehicle Details</h2>
+      <div class="cards-grid">
+        ${VEHICLES.map(renderCard).join('')}
+      </div>
+    </div>`;
+}
+
+init();
+"""
+
+    _HTML_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#E7ECF2;color:#0F1B2D;font-family:system-ui,-apple-system,sans-serif;
+  -webkit-font-smoothing:antialiased;padding:20px 16px 60px;min-height:100vh}
+.wrap{max-width:1080px;margin:0 auto}
+.eyebrow{font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.14em;
+  text-transform:uppercase;color:#63768F}
+h1{font-size:22px;font-weight:800;letter-spacing:-.02em;margin-top:4px}
+.page-head{display:flex;align-items:flex-start;justify-content:space-between;
+  gap:16px;flex-wrap:wrap;margin-bottom:24px}
+.head-right{text-align:right}
+.gen-at{font-size:11.5px;color:#63768F;margin-top:6px}
+.summary-badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.badge{font-size:11.5px;font-weight:600;padding:3px 10px;border-radius:999px}
+.badge-ok{background:#d1fae5;color:#065f46}
+.badge-watch{background:#fef3c7;color:#92400e}
+.badge-high{background:#fee2e2;color:#991b1b}
+.badge-unk{background:#f3f4f6;color:#374151}
+.section-title{font-size:14px;font-weight:700;letter-spacing:-.01em;
+  margin-bottom:12px;color:#0F1B2D}
+.table-wrap{overflow-x:auto;border-radius:12px;border:1px solid #D3DBE6}
+.fleet-table{width:100%;border-collapse:collapse;background:#fff;
+  font-size:13px;border-radius:12px;overflow:hidden}
+.fleet-table th{background:#F8FAFB;color:#63768F;font-size:10.5px;letter-spacing:.1em;
+  text-transform:uppercase;padding:10px 14px;text-align:left;border-bottom:1px solid #D3DBE6;
+  white-space:nowrap}
+.fleet-table td{padding:10px 14px;border-bottom:1px solid #D3DBE6}
+.fleet-table tbody tr:last-child td{border-bottom:none}
+.fleet-table tbody tr:hover{background:#F8FAFB}
+.td-id{font-family:ui-monospace,monospace;font-size:12px}
+.td-soh.risk-high{color:#C2410C;font-weight:700}
+.td-soh.risk-watch{color:#d97706;font-weight:600}
+.td-soh.risk-ok{color:#047857;font-weight:600}
+.risk-pill{display:inline-flex;align-items:center;font-size:11px;font-weight:600;
+  padding:2px 9px;border-radius:999px}
+.risk-high{background:#fee2e2;color:#991b1b}
+.risk-watch{background:#fef3c7;color:#92400e}
+.risk-ok{background:#d1fae5;color:#065f46}
+.risk-unk{background:#f3f4f6;color:#374151}
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(540px,1fr));gap:20px}
+.vcard{background:#fff;border:1px solid #D3DBE6;border-radius:14px;overflow:hidden;
+  padding:20px 22px 16px}
+.vcard-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.vid{font-family:ui-monospace,monospace;font-size:15px;font-weight:700;
+  letter-spacing:-.01em;margin-top:3px}
+.chart-wrap{margin:0 -4px 16px}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stat-box{background:#F8FAFB;border:1px solid #D3DBE6;border-radius:10px;padding:14px 16px}
+.stat-big{font-size:26px;font-weight:800;letter-spacing:-.03em;margin:5px 0 3px;
+  font-variant-numeric:tabular-nums}
+.stat-note{font-size:11.5px;color:#63768F;line-height:1.45}
+.sub-note{font-size:11px;color:#63768F;display:block;margin-top:2px}
+.status-note{font-size:12.5px;color:#63768F;background:#F8FAFB;border-radius:8px;
+  padding:10px 14px;margin-top:12px;line-height:1.5}
+.vcard-foot{font-size:11px;color:#A0AEC0;margin-top:12px}
+.ax{font-family:ui-monospace,monospace;font-size:9.5px;fill:#63768F}
+.eol-lbl{fill:#C2410C;font-size:8.5px}
+@media(max-width:600px){
+  .cards-grid{grid-template-columns:1fr}
+  .stats-grid{grid-template-columns:1fr}
+  h1{font-size:18px}
+}
+"""
+
+    html = (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
+        '<title>Fleet Battery Health</title>\n'
+        f'<style>{_HTML_CSS}</style>\n'
+        '</head>\n<body>\n<div id="root"></div>\n<script>\n'
+        f'const VEHICLES = {data_json};\n'
+        f'const GENERATED_AT = {json.dumps(gen_at)};\n'
+        f'{_HTML_JS}\n'
+        '</script>\n</body>\n</html>\n'
+    )
+
+    html_path = Path(plot_path).with_suffix('.html')
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(html_path, 'w', encoding='utf-8') as fh:
+        fh.write(html)
+    print(f"\n  Fleet health HTML report -> {html_path}")
+    return html_path
+
+
 # ------------------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------------------
@@ -4789,6 +5177,7 @@ def run_pipeline(
                 _print_summary_tables(rul_all, replacement_events)
                 plot_results(xgb_results, lstm_results, rul_all, plot_path)
                 plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
+                _generate_html_report(xgb_results, rul_all, plot_path)
                 return xgb_results, lstm_results, rul_all
         raise
 
@@ -4956,6 +5345,7 @@ def run_pipeline(
     _print_summary_tables(rul_all, replacement_events)
     plot_results(xgb_results, lstm_results, rul_all, plot_path)
     plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, plot_path)
+    _generate_html_report(xgb_results, rul_all, plot_path)
 
     # Always save state (full or inc) so the next inc run has correct sessions.
     # Compute per-vehicle watermarks from the raw data max utc.
