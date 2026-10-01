@@ -61,7 +61,10 @@ warnings.filterwarnings('ignore')
 SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
-EXPECTED_CAPACITY_OPTIONS_AH = (103.5, 161.0, 322.0, 644.0)  # Fleet pack capacities (208-series calibrated from 4 VECV physical SOH measurements: median q_new=322 Ah)
+PACK_DOD_FACTOR               = 0.95                          # 95 % depth-of-discharge: fuelLevel 0-100% spans 95% of physical capacity
+#   → effective spec capacity = spec_Ah / PACK_DOD_FACTOR (e.g. 306 / 0.95 = 322.1 Ah)
+_D = PACK_DOD_FACTOR  # shorthand used in capacity literals below
+EXPECTED_CAPACITY_OPTIONS_AH = (103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1))  # Fleet pack capacities (DOD-adjusted)
 REPORT_RUL_CAP_DAYS = 2922.0          # RUL reporting horizon cap (days) — 96 months
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
@@ -79,10 +82,10 @@ REPL_SOH_JUMP_PCT   = 10.0            # Replacement detection: SOH jump %
 # ------------------------------------------------------------------------------
 # INTERNAL DEFAULTS (normally do not edit)
 # ------------------------------------------------------------------------------
-Q_RATED_AH    = 322.0                 # Fallback nominal capacity floor (calibrated to 208s2p fleet)
+Q_RATED_AH    = round(306.0 / _D, 1)  # Fallback nominal capacity floor (DOD-adjusted: 306/0.95)
 MAX_TAIL_STRIP = 2                    # Tail-drop correction strips
 SOFT_MIN_DROP_LABEL = 0.4             # Min total drop on smoothed pseudo-label
-INIT_CAPACITY_CYCLES = 25             # Auto-estimate init capacity from first N charging sessions
+INIT_CAPACITY_CYCLES = 50             # Auto-estimate init capacity from first N charging sessions
 HRLFC_WRAP_MOD      = 65536.0         # 16-bit counter wrap value (2^16)
 HRLFC_VALID_MAX     = 65600.0         # Valid range + sensor slack
 PACK_CHANGE_HRLFC_DROP_MIN      = 200.0  # HRLFC must drop ≥ 200 units between sessions for BMS reset signal
@@ -97,7 +100,7 @@ CELL_VOLT_NOM = 3.2                  # Cell nominal voltage (V) for series estim
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
     96: (103.5,),
     120: (103.5,),
-    208: (161.0, 322.0, 644.0),      # 208s1p / 208s2p / 208s4p (calibrated)
+    208: (round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)),  # 208s1p / 208s2p / 208s4p (DOD-adjusted)
 }
 PACK_CLASSIFY_W_SERIES = 0.45
 PACK_CLASSIFY_W_VOLT = 0.20
@@ -109,16 +112,16 @@ PACK_208_FORCE_4P_Q_THRESHOLD_AH = 400.0
 PACK_208_FORCE_2P_Q_THRESHOLD_AH = 170.0
 PACK_208_FORCE_1P_Q_THRESHOLD_AH = 160.0
 BASELINE_MAX_DRIFT_PCT = 5.0         # Per-run cap on baseline drift unless replacement signal is strong
-STRICT_PACK_BASELINE_ENABLED = True   # Force baseline to calibrated nominal (322 Ah for 208s2p); measured early sessions are unreliable when data starts mid-life
+STRICT_PACK_BASELINE_ENABLED = False  # Use data-driven initial capacity from first 50 clean sessions (delta_soc>30%, no jumps/drops)
 PACK_USABLE_FRACTION = 1.00          # Usable fraction applied to nominal pack capacity
 BMS_CALIBRATION_ENABLED = True        # Scale implied_Q_Ah by per-vehicle BMS/MY ratio when BMS columns present
 BMS_INIT_CAP_OVERRIDE   = True        # Use BMS initial capacity as q_base when bms_init_cap column present
 PACK_FIXED_BASELINE_AH = {
-    '96s1p':  103.5,
+    '96s1p': 103.5,
     '120s1p': 103.5,
-    '208s1p': 161.0,   # calibrated: 322 / 2
-    '208s2p': 322.0,   # calibrated from 4 VECV physical SOH measurements (median back-calc q_new)
-    '208s4p': 644.0,   # calibrated: 322 * 2
+    '208s1p': round(153.0 / _D, 1),   # 153 / 0.95 = 161.1 Ah
+    '208s2p': round(306.0 / _D, 1),   # 306 / 0.95 = 322.1 Ah
+    '208s4p': round(612.0 / _D, 1),   # 612 / 0.95 = 644.2 Ah
 }
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
@@ -186,7 +189,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 161.0, 322.0, 644.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.8,
         'SOFT_MIN_DROP_LSTM': 0.8,
@@ -198,7 +201,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 2.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 161.0, 322.0, 644.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.6,
         'SOFT_MIN_DROP_LSTM': 0.6,
@@ -210,7 +213,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 0.5,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 161.0, 322.0, 644.0],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 1.0,
         'SOFT_MIN_DROP_LSTM': 1.0,
@@ -479,7 +482,7 @@ def _parse_pack_config_guess(cfg_text: str):
 def _capacity_options_from_pack_config(cfg_text: str):
     s_cells, p_count = _parse_pack_config_guess(cfg_text)
     if np.isfinite(s_cells) and np.isfinite(p_count) and int(s_cells) == 208:
-        return (322.0,) if int(p_count) >= 2 else (161.0,)
+        return (round(306.0/_D,1),) if int(p_count) >= 2 else (round(153.0/_D,1),)
     if np.isfinite(s_cells):
         return tuple(float(v) for v in PACK_CAPACITY_OPTIONS_BY_SERIES.get(int(s_cells), EXPECTED_CAPACITY_OPTIONS_AH))
     return tuple(float(v) for v in EXPECTED_CAPACITY_OPTIONS_AH)
@@ -1179,9 +1182,9 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     candidates = [
         {'series': 96, 'parallel': 1, 'nom_ah': 103.5},
         {'series': 120, 'parallel': 1, 'nom_ah': 103.5},
-        {'series': 208, 'parallel': 1, 'nom_ah': 161.0},
-        {'series': 208, 'parallel': 2, 'nom_ah': 322.0},
-        {'series': 208, 'parallel': 4, 'nom_ah': 644.0},
+        {'series': 208, 'parallel': 1, 'nom_ah': round(153.0/_D,1)},
+        {'series': 208, 'parallel': 2, 'nom_ah': round(306.0/_D,1)},
+        {'series': 208, 'parallel': 4, 'nom_ah': round(612.0/_D,1)},
     ]
     scored = []
     for cand in candidates:
@@ -1238,13 +1241,13 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     chosen_series_pre = int(chosen['series'])
     if chosen_series_pre == 208 and q_q_count >= 8 and np.isfinite(q_data_med):
         if q_data_med >= float(PACK_208_FORCE_4P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 644.0}
+            chosen = {'series': 208, 'parallel': 4, 'nom_ah': round(612.0/_D,1)}
             options_source = 'force_208_4p_from_q'
         elif q_data_med >= float(PACK_208_FORCE_2P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 322.0}
+            chosen = {'series': 208, 'parallel': 2, 'nom_ah': round(306.0/_D,1)}
             options_source = 'force_208_2p_from_q'
         elif q_data_med <= float(PACK_208_FORCE_1P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 161.0}
+            chosen = {'series': 208, 'parallel': 1, 'nom_ah': round(153.0/_D,1)}
             options_source = 'force_208_1p_from_q'
 
     chosen_series = int(chosen['series'])
@@ -1327,9 +1330,12 @@ def _estimate_initial_capacity_ah(g: pd.DataFrame, first_cycles: int = INIT_CAPA
         out['source'] = 'fallback_no_early'
         return out
 
+    # Primary filter: require >30% SOC swing so fuelLevel noise doesn't dominate
+    # implied_Q. Sessions with small delta_soc have huge relative error in the
+    # ah / (delta_soc/100) ratio and create spurious jumps/drops.
     mask = pd.Series(True, index=early.index, dtype=bool)
     if 'delta_soc_pct' in early.columns:
-        mask &= _finite_series(early['delta_soc_pct']) >= 5.0
+        mask &= _finite_series(early['delta_soc_pct']) >= 30.0
     if 'duration_min' in early.columns:
         mask &= _finite_series(early['duration_min']) >= 10.0
     if 'ah_total' in early.columns:
@@ -1337,10 +1343,10 @@ def _estimate_initial_capacity_ah(g: pd.DataFrame, first_cycles: int = INIT_CAPA
 
     q_early = _finite_series(early.loc[mask, 'implied_Q_Ah'])
     if q_early.notna().sum() < 4:
-        # Relax only slightly; avoid anchoring on tiny-SOC/noisy sessions.
+        # Relax delta_soc to 15% if fewer than 4 sessions pass the 30% gate.
         relaxed = pd.Series(True, index=early.index, dtype=bool)
         if 'delta_soc_pct' in early.columns:
-            relaxed &= _finite_series(early['delta_soc_pct']) >= 5.0
+            relaxed &= _finite_series(early['delta_soc_pct']) >= 15.0
         if 'duration_min' in early.columns:
             relaxed &= _finite_series(early['duration_min']) >= 6.0
         if 'ah_total' in early.columns:
@@ -1350,14 +1356,22 @@ def _estimate_initial_capacity_ah(g: pd.DataFrame, first_cycles: int = INIT_CAPA
     q_vals = q_early.dropna().values.astype(float)
     q_vals = q_vals[np.isfinite(q_vals) & (q_vals > 0)]
     if len(q_vals) >= 4:
+        # IQR outlier removal — tighter (1.0×) to reject sudden jumps/drops
         q1, q3 = np.percentile(q_vals, [25, 75])
         iqr = q3 - q1
         if np.isfinite(iqr) and iqr > 0:
-            lo = q1 - 1.5 * iqr
-            hi = q3 + 1.5 * iqr
+            lo = q1 - 1.0 * iqr
+            hi = q3 + 1.0 * iqr
             q_trim = q_vals[(q_vals >= lo) & (q_vals <= hi)]
             if len(q_trim) >= 3:
                 q_vals = q_trim
+        # Consecutive-jump filter: drop any session whose implied_Q deviates
+        # more than 20% from the median of the already-cleaned set. This catches
+        # single-point spikes (e.g. BMS recalibration mid-session) that survive IQR.
+        if len(q_vals) >= 4:
+            med = float(np.median(q_vals))
+            if med > 0:
+                q_vals = q_vals[np.abs(q_vals - med) / med <= 0.20]
 
     q_init = float(np.nanmedian(q_vals)) if len(q_vals) > 0 else np.nan
     out['q_init_first_ah'] = q_init
@@ -2764,8 +2778,8 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.DataFrame:
             if chg:
                 _q_pre  = float(roll_q_prev.iloc[_i]) if np.isfinite(roll_q_prev.iloc[_i]) else np.nan
                 _q_post = float(roll_q.iloc[_i])      if np.isfinite(roll_q.iloc[_i])      else np.nan
-                _s_old  = _q_pre  / (p * 161.0) if np.isfinite(_q_pre)  else np.nan
-                _s_new  = _q_post / (p * 161.0) if np.isfinite(_q_post) else np.nan
+                _s_old  = _q_pre  / (p * round(153.0/_D,1)) if np.isfinite(_q_pre)  else np.nan
+                _s_new  = _q_post / (p * round(153.0/_D,1)) if np.isfinite(_q_post) else np.nan
                 _n_est  = round(jfrac * p * _s_old / (_s_new - _s_old)) \
                           if (np.isfinite(_s_old) and np.isfinite(_s_new)
                               and (_s_new - _s_old) > 0.01) else '?'
@@ -4359,27 +4373,11 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
             # Only draw tangent extrapolation when axis units match the model axis.
             # When hrlfc_mid was used for fitting but the display is elapsed_days,
             # hrlfc_now / rul_hrlfc_p50 are in wrong units for the display axis.
-            _axis_used  = rul.get('axis_used', '')
-            _slope_basis = rul.get('slope_basis', '')
+            _axis_used = rul.get('axis_used', '')
             _can_extrap = ((_axis_used == 'elapsed_days' and x_label == 'elapsed_days') or
                            (_axis_used == 'hrlfc_mid'    and x_label == 'hrlfc_mid') or
                            (_axis_used == 'session_idx'  and x_label == 'session_idx'))
-            # ah_throughput paths compute rul_days_p50 in calendar days; draw those
-            # using the display x-axis instead of raw hrlfc counter units.
-            _rul_days = rul.get('rul_days_p50', np.nan)
-            _soh_now_v = rul.get('soh_now', np.nan)
-            if ('ah_throughput' in _slope_basis and
-                    np.isfinite(_rul_days) and _rul_days > 0 and
-                    np.isfinite(_soh_now_v) and x_label == 'elapsed_days' and len(x) > 0):
-                _x_now  = float(x[np.isfinite(x)][-1]) if np.isfinite(x).any() else 0.0
-                _x_eol  = _x_now + float(_rul_days)
-                _slope_d = (SOH_EOL - _soh_now_v) / float(_rul_days)
-                x_ext = np.linspace(_x_now, _x_eol * 1.15, 100)
-                y_ext = _soh_now_v + _slope_d * (x_ext - _x_now)
-                y_ext_plot = _ease_curve_to_soh_eol_for_plot(y_ext, eol=SOH_EOL)
-                ax.plot(x_ext, y_ext_plot, 'r--', lw=1.5, alpha=0.7, label='Extrapolation')
-                ax.axvline(_x_eol, color='red', linestyle=':', alpha=0.6)
-            elif (_can_extrap and rul.get('phase2_slope', 0) < 0 and
+            if (_can_extrap and rul.get('phase2_slope', 0) < 0 and
                     np.isfinite(rul.get('hrlfc_now', np.nan)) and
                     np.isfinite(rul.get('rul_hrlfc_p50', np.nan))):
                 h_now = rul['hrlfc_now']
@@ -4401,12 +4399,6 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
         ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
         ax.set_ylim(70, 105)
-        # Clamp x-axis to history + 1.5× RUL so the plot is always readable.
-        # Without this the old hrlfc-unit code can stretch the axis to 10^7+.
-        _x_last = float(x[np.isfinite(x)][-1]) if np.isfinite(x).any() else 0.0
-        _x_right = (_x_last + float(_rul_days) * 1.5) if np.isfinite(_rul_days) and _rul_days > 0 else _x_last * 1.25
-        if np.isfinite(_x_right) and _x_right > _x_last:
-            ax.set_xlim(left=max(0, _x_last * -0.02), right=_x_right)
 
         ax = axes[2]
         res['feature_importance'].head(8).plot(kind='barh', ax=ax, color='teal', alpha=0.7)
