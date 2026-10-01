@@ -4359,11 +4359,27 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
             # Only draw tangent extrapolation when axis units match the model axis.
             # When hrlfc_mid was used for fitting but the display is elapsed_days,
             # hrlfc_now / rul_hrlfc_p50 are in wrong units for the display axis.
-            _axis_used = rul.get('axis_used', '')
+            _axis_used  = rul.get('axis_used', '')
+            _slope_basis = rul.get('slope_basis', '')
             _can_extrap = ((_axis_used == 'elapsed_days' and x_label == 'elapsed_days') or
                            (_axis_used == 'hrlfc_mid'    and x_label == 'hrlfc_mid') or
                            (_axis_used == 'session_idx'  and x_label == 'session_idx'))
-            if (_can_extrap and rul.get('phase2_slope', 0) < 0 and
+            # ah_throughput paths compute rul_days_p50 in calendar days; draw those
+            # using the display x-axis instead of raw hrlfc counter units.
+            _rul_days = rul.get('rul_days_p50', np.nan)
+            _soh_now_v = rul.get('soh_now', np.nan)
+            if ('ah_throughput' in _slope_basis and
+                    np.isfinite(_rul_days) and _rul_days > 0 and
+                    np.isfinite(_soh_now_v) and x_label == 'elapsed_days' and len(x) > 0):
+                _x_now  = float(x[np.isfinite(x)][-1]) if np.isfinite(x).any() else 0.0
+                _x_eol  = _x_now + float(_rul_days)
+                _slope_d = (SOH_EOL - _soh_now_v) / float(_rul_days)
+                x_ext = np.linspace(_x_now, _x_eol * 1.15, 100)
+                y_ext = _soh_now_v + _slope_d * (x_ext - _x_now)
+                y_ext_plot = _ease_curve_to_soh_eol_for_plot(y_ext, eol=SOH_EOL)
+                ax.plot(x_ext, y_ext_plot, 'r--', lw=1.5, alpha=0.7, label='Extrapolation')
+                ax.axvline(_x_eol, color='red', linestyle=':', alpha=0.6)
+            elif (_can_extrap and rul.get('phase2_slope', 0) < 0 and
                     np.isfinite(rul.get('hrlfc_now', np.nan)) and
                     np.isfinite(rul.get('rul_hrlfc_p50', np.nan))):
                 h_now = rul['hrlfc_now']
@@ -4385,6 +4401,12 @@ def plot_results(xgb_results, lstm_results, rul_all, save_path):
         ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
         ax.set_ylim(70, 105)
+        # Clamp x-axis to history + 1.5× RUL so the plot is always readable.
+        # Without this the old hrlfc-unit code can stretch the axis to 10^7+.
+        _x_last = float(x[np.isfinite(x)][-1]) if np.isfinite(x).any() else 0.0
+        _x_right = (_x_last + float(_rul_days) * 1.5) if np.isfinite(_rul_days) and _rul_days > 0 else _x_last * 1.25
+        if np.isfinite(_x_right) and _x_right > _x_last:
+            ax.set_xlim(left=max(0, _x_last * -0.02), right=_x_right)
 
         ax = axes[2]
         res['feature_importance'].head(8).plot(kind='barh', ax=ax, color='teal', alpha=0.7)
