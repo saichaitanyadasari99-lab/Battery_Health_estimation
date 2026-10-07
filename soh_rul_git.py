@@ -61,10 +61,7 @@ warnings.filterwarnings('ignore')
 SOH_EOL       = 80.0                  # End-of-life SOH threshold %
 MIN_DELTA_SOC = 2.0                   # Minimum SOC swing % to use a session
 MIN_AH        = 1.0                   # Minimum Ah delivered in a session
-PACK_DOD_FACTOR               = 0.95                          # 95 % depth-of-discharge: fuelLevel 0-100% spans 95% of physical capacity
-#   → effective spec capacity = spec_Ah / PACK_DOD_FACTOR (e.g. 306 / 0.95 = 322.1 Ah)
-_D = PACK_DOD_FACTOR  # shorthand used in capacity literals below
-EXPECTED_CAPACITY_OPTIONS_AH = (103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1))  # Fleet pack capacities (DOD-adjusted)
+EXPECTED_CAPACITY_OPTIONS_AH = (103.5, 153.0, 306.0, 612.0)  # Fleet pack capacities
 REPORT_RUL_CAP_DAYS = 2922.0          # RUL reporting horizon cap (days) — 96 months
 VEHICLE_ID_ALIASES = {}               # Optional: {"actual_vehicle": ["old_device_id", "new_device_id"]}
 VEHICLE_ID_ALIAS_PATH = None          # Optional JSON path; auto-detects vehicle_id_aliases.json if None
@@ -82,10 +79,10 @@ REPL_SOH_JUMP_PCT   = 10.0            # Replacement detection: SOH jump %
 # ------------------------------------------------------------------------------
 # INTERNAL DEFAULTS (normally do not edit)
 # ------------------------------------------------------------------------------
-Q_RATED_AH    = round(306.0 / _D, 1)  # Fallback nominal capacity floor (DOD-adjusted: 306/0.95)
+Q_RATED_AH    = 304.0                 # Fallback nominal capacity floor
 MAX_TAIL_STRIP = 2                    # Tail-drop correction strips
 SOFT_MIN_DROP_LABEL = 0.4             # Min total drop on smoothed pseudo-label
-INIT_CAPACITY_CYCLES = 50             # Auto-estimate init capacity from first N charging sessions
+INIT_CAPACITY_CYCLES = 25             # Auto-estimate init capacity from first N charging sessions
 HRLFC_WRAP_MOD      = 65536.0         # 16-bit counter wrap value (2^16)
 HRLFC_VALID_MAX     = 65600.0         # Valid range + sensor slack
 PACK_CHANGE_HRLFC_DROP_MIN      = 200.0  # HRLFC must drop ≥ 200 units between sessions for BMS reset signal
@@ -100,7 +97,7 @@ CELL_VOLT_NOM = 3.2                  # Cell nominal voltage (V) for series estim
 PACK_CAPACITY_OPTIONS_BY_SERIES = {
     96: (103.5,),
     120: (103.5,),
-    208: (round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)),  # 208s1p / 208s2p / 208s4p (DOD-adjusted)
+    208: (153.0, 306.0, 612.0),      # 208s1p / 208s2p / 208s4p
 }
 PACK_CLASSIFY_W_SERIES = 0.45
 PACK_CLASSIFY_W_VOLT = 0.20
@@ -112,16 +109,16 @@ PACK_208_FORCE_4P_Q_THRESHOLD_AH = 400.0
 PACK_208_FORCE_2P_Q_THRESHOLD_AH = 170.0
 PACK_208_FORCE_1P_Q_THRESHOLD_AH = 160.0
 BASELINE_MAX_DRIFT_PCT = 5.0         # Per-run cap on baseline drift unless replacement signal is strong
-STRICT_PACK_BASELINE_ENABLED = False  # Use data-driven initial capacity from first 50 clean sessions (delta_soc>30%, no jumps/drops)
+STRICT_PACK_BASELINE_ENABLED = True   # Force baseline capacity from inferred pack config
 PACK_USABLE_FRACTION = 1.00          # Usable fraction applied to nominal pack capacity
 BMS_CALIBRATION_ENABLED = True        # Scale implied_Q_Ah by per-vehicle BMS/MY ratio when BMS columns present
 BMS_INIT_CAP_OVERRIDE   = True        # Use BMS initial capacity as q_base when bms_init_cap column present
 PACK_FIXED_BASELINE_AH = {
     '96s1p': 103.5,
     '120s1p': 103.5,
-    '208s1p': round(153.0 / _D, 1),   # 153 / 0.95 = 161.1 Ah
-    '208s2p': round(306.0 / _D, 1),   # 306 / 0.95 = 322.1 Ah
-    '208s4p': round(612.0 / _D, 1),   # 612 / 0.95 = 644.2 Ah
+    '208s1p': 153.0,
+    '208s2p': 306.0,
+    '208s4p': 612.0,
 }
 SOH_LABEL_MIN_DELTA_SOC     = 10.0    # Min delta_soc % for a session to contribute its own soh_label
                                        # Sessions below this are NaN'd and interpolated from neighbours.
@@ -149,7 +146,8 @@ REPL_PERSIST_M = 6                    # Lookahead window for persistence
 REPL_PERSIST_K = 3                    # Required confirmations in lookahead
 CONFIRM_WINDOW_DOWN = 30              # Consecutive sessions needed to confirm a new LOWER SOH
 CONFIRM_WINDOW_UP   = 20             # Consecutive sessions needed to confirm a new HIGHER SOH
-CONFIRM_THRESHOLD   = 3.0             # pp — within this of confirmed SOH → accepted immediately
+CONFIRM_UP_CAP_PP   = 2.0             # pp — max rise allowed above the lowest confirmed SOH; larger upward jumps are held
+CONFIRM_THRESHOLD   = 3.0            # pp — within this of confirmed SOH → accepted immediately
 
 # ------------------------------------------------------------------------------
 # CONFIG PROFILES
@@ -189,7 +187,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.8,
         'SOFT_MIN_DROP_LSTM': 0.8,
@@ -201,7 +199,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 2.0,
         'MIN_AH': 1.0,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 0.6,
         'SOFT_MIN_DROP_LSTM': 0.6,
@@ -213,7 +211,7 @@ CONFIG_PROFILES = {
         'SOH_EOL': 80.0,
         'MIN_DELTA_SOC': 1.0,
         'MIN_AH': 0.5,
-        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, round(153.0/_D,1), round(306.0/_D,1), round(612.0/_D,1)],
+        'EXPECTED_CAPACITY_OPTIONS_AH': [103.5, 153.0, 306.0, 612.0],
         'REPORT_RUL_CAP_DAYS': 2922.0,
         'SOFT_MIN_DROP_XGB': 1.0,
         'SOFT_MIN_DROP_LSTM': 1.0,
@@ -482,7 +480,7 @@ def _parse_pack_config_guess(cfg_text: str):
 def _capacity_options_from_pack_config(cfg_text: str):
     s_cells, p_count = _parse_pack_config_guess(cfg_text)
     if np.isfinite(s_cells) and np.isfinite(p_count) and int(s_cells) == 208:
-        return (round(306.0/_D,1),) if int(p_count) >= 2 else (round(153.0/_D,1),)
+        return (304.0,) if int(p_count) >= 2 else (152.0,)
     if np.isfinite(s_cells):
         return tuple(float(v) for v in PACK_CAPACITY_OPTIONS_BY_SERIES.get(int(s_cells), EXPECTED_CAPACITY_OPTIONS_AH))
     return tuple(float(v) for v in EXPECTED_CAPACITY_OPTIONS_AH)
@@ -1006,7 +1004,8 @@ def _soft_monotone_curve(values, x=None, min_total_drop=0.0, smooth_window=9):
 def _apply_confirmation_gate(values,
                               threshold=CONFIRM_THRESHOLD,
                               window_down=CONFIRM_WINDOW_DOWN,
-                              window_up=CONFIRM_WINDOW_UP):
+                              window_up=CONFIRM_WINDOW_UP,
+                              segments=None):
     """Customer-facing SOH display with asymmetric confirmation window.
 
     Within threshold pp of last confirmed: accepted immediately.
@@ -1029,6 +1028,11 @@ def _apply_confirmation_gate(values,
 
     pending       = np.nan
     pending_count = 0
+    # Batteries do not regain capacity: the displayed SOH may not rise more than
+    # CONFIRM_UP_CAP_PP above the lowest confirmed value. Sudden upward steps
+    # (e.g. BMS gauge recalibration) are held, never confirmed.
+    floor = confirmed
+    seg_arr = np.asarray(segments) if segments is not None and len(segments) == len(arr) else None
 
     for i in range(len(arr)):
         cur = arr[i]
@@ -1036,8 +1040,24 @@ def _apply_confirmation_gate(values,
             out[i] = confirmed
             continue
 
+        # A confirmed pack change (HRLFC reset + capacity jump) starts a new baseline.
+        if seg_arr is not None and i > 0 and seg_arr[i] != seg_arr[i - 1]:
+            confirmed     = cur
+            floor         = cur
+            pending       = np.nan
+            pending_count = 0
+            out[i]        = confirmed
+            continue
+
+        if cur > floor + CONFIRM_UP_CAP_PP:
+            pending       = np.nan
+            pending_count = 0
+            out[i]        = confirmed
+            continue
+
         if abs(cur - confirmed) <= threshold:
             confirmed     = cur
+            floor         = min(floor, confirmed)
             pending       = np.nan
             pending_count = 0
             out[i]        = confirmed
@@ -1053,6 +1073,7 @@ def _apply_confirmation_gate(values,
 
             if pending_count >= window:
                 confirmed     = cur
+                floor         = min(floor, confirmed)
                 pending       = np.nan
                 pending_count = 0
                 out[i]        = confirmed
@@ -1061,6 +1082,64 @@ def _apply_confirmation_gate(values,
 
     return out
 
+
+JUMP_MIN_PP          = 2.0    # Smallest upward SOH step (pp) treated as a jump
+JUMP_CONFIRM_SESSIONS = 10    # Sessions the new level must persist before a jump is called persistent
+JUMP_REVIEW_PP       = 3.0    # Persistent jumps >= this (pp) with no pack change are flagged for review
+JUMP_REVIEW_SESSIONS = 30     # ...and still held after this many sessions
+
+def _classify_soh_jumps(soh, segments=None, window=JUMP_CONFIRM_SESSIONS):
+    """Classify upward SOH steps. Verdicts:
+      pack_change      - pack segment id changes at the step (HRLFC reset + capacity jump)
+      noise            - level does not persist for `window` sessions
+      gauge_artifact   - persists >= window sessions with no pack change; display holds
+                         the previous value (batteries do not regain capacity)
+    Persistent artifacts >= JUMP_REVIEW_PP that last >= JUMP_REVIEW_SESSIONS get review=True.
+    """
+    arr = np.asarray(soh, dtype=float)
+    n = len(arr)
+    seg = np.asarray(segments) if segments is not None and len(segments) == n else None
+    events = []
+    if n < 2 * window + 2:
+        return events
+    steps = np.full(n, np.nan)
+    for j in range(window, n - window + 1):
+        pre_j = np.nanmedian(arr[j - window:j]) if np.isfinite(arr[j - window:j]).any() else np.nan
+        nx_j = arr[j:j + window]
+        post_j = np.nanmedian(nx_j) if np.isfinite(nx_j).any() else np.nan
+        if np.isfinite(pre_j) and np.isfinite(post_j):
+            steps[j] = post_j - pre_j
+    i = window
+    while i < n - window + 1:
+        if not (np.isfinite(steps[i]) and steps[i] >= JUMP_MIN_PP):
+            i += 1
+            continue
+        lo_j, hi_j = max(window, i - window), min(n - window + 1, i + window + 1)
+        if steps[i] < np.nanmax(steps[lo_j:hi_j]):
+            i += 1
+            continue
+        pre = float(np.nanmedian(arr[i - window:i]))
+        post = float(np.nanmedian(arr[i:i + window]))
+        step = post - pre
+        held = 0
+        if seg is not None and np.any(seg[i - 1:min(n, i + window)] != seg[i - 1]):
+            verdict = 'pack_change'
+        else:
+            level = pre + 0.6 * step
+            for v in arr[i:]:
+                if np.isfinite(v) and v >= level:
+                    held += 1
+                else:
+                    break
+            verdict = 'gauge_artifact' if held >= window else 'noise'
+        ev = {'pos': int(i), 'step_pp': round(step, 2), 'pre': round(pre, 2),
+              'post': round(post, 2), 'verdict': verdict, 'review': False}
+        if verdict == 'gauge_artifact':
+            ev['sessions_held'] = int(held)
+            ev['review'] = bool(step >= JUMP_REVIEW_PP and held >= JUMP_REVIEW_SESSIONS)
+        events.append(ev)
+        i += window
+    return events
 
 
 def _calibrate_capacity_ah(q_raw, options=None, scales=None):
@@ -1182,9 +1261,9 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     candidates = [
         {'series': 96, 'parallel': 1, 'nom_ah': 103.5},
         {'series': 120, 'parallel': 1, 'nom_ah': 103.5},
-        {'series': 208, 'parallel': 1, 'nom_ah': round(153.0/_D,1)},
-        {'series': 208, 'parallel': 2, 'nom_ah': round(306.0/_D,1)},
-        {'series': 208, 'parallel': 4, 'nom_ah': round(612.0/_D,1)},
+        {'series': 208, 'parallel': 1, 'nom_ah': 153.0},
+        {'series': 208, 'parallel': 2, 'nom_ah': 306.0},
+        {'series': 208, 'parallel': 4, 'nom_ah': 612.0},
     ]
     scored = []
     for cand in candidates:
@@ -1241,13 +1320,13 @@ def _infer_pack_config_options(g: pd.DataFrame, q_anchor=np.nan, q_prev=np.nan):
     chosen_series_pre = int(chosen['series'])
     if chosen_series_pre == 208 and q_q_count >= 8 and np.isfinite(q_data_med):
         if q_data_med >= float(PACK_208_FORCE_4P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 4, 'nom_ah': round(612.0/_D,1)}
+            chosen = {'series': 208, 'parallel': 4, 'nom_ah': 612.0}
             options_source = 'force_208_4p_from_q'
         elif q_data_med >= float(PACK_208_FORCE_2P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 2, 'nom_ah': round(306.0/_D,1)}
+            chosen = {'series': 208, 'parallel': 2, 'nom_ah': 306.0}
             options_source = 'force_208_2p_from_q'
         elif q_data_med <= float(PACK_208_FORCE_1P_Q_THRESHOLD_AH):
-            chosen = {'series': 208, 'parallel': 1, 'nom_ah': round(153.0/_D,1)}
+            chosen = {'series': 208, 'parallel': 1, 'nom_ah': 153.0}
             options_source = 'force_208_1p_from_q'
 
     chosen_series = int(chosen['series'])
@@ -1330,12 +1409,9 @@ def _estimate_initial_capacity_ah(g: pd.DataFrame, first_cycles: int = INIT_CAPA
         out['source'] = 'fallback_no_early'
         return out
 
-    # Primary filter: require >30% SOC swing so fuelLevel noise doesn't dominate
-    # implied_Q. Sessions with small delta_soc have huge relative error in the
-    # ah / (delta_soc/100) ratio and create spurious jumps/drops.
     mask = pd.Series(True, index=early.index, dtype=bool)
     if 'delta_soc_pct' in early.columns:
-        mask &= _finite_series(early['delta_soc_pct']) >= 30.0
+        mask &= _finite_series(early['delta_soc_pct']) >= 5.0
     if 'duration_min' in early.columns:
         mask &= _finite_series(early['duration_min']) >= 10.0
     if 'ah_total' in early.columns:
@@ -1343,10 +1419,10 @@ def _estimate_initial_capacity_ah(g: pd.DataFrame, first_cycles: int = INIT_CAPA
 
     q_early = _finite_series(early.loc[mask, 'implied_Q_Ah'])
     if q_early.notna().sum() < 4:
-        # Relax delta_soc to 15% if fewer than 4 sessions pass the 30% gate.
+        # Relax only slightly; avoid anchoring on tiny-SOC/noisy sessions.
         relaxed = pd.Series(True, index=early.index, dtype=bool)
         if 'delta_soc_pct' in early.columns:
-            relaxed &= _finite_series(early['delta_soc_pct']) >= 15.0
+            relaxed &= _finite_series(early['delta_soc_pct']) >= 5.0
         if 'duration_min' in early.columns:
             relaxed &= _finite_series(early['duration_min']) >= 6.0
         if 'ah_total' in early.columns:
@@ -1356,22 +1432,14 @@ def _estimate_initial_capacity_ah(g: pd.DataFrame, first_cycles: int = INIT_CAPA
     q_vals = q_early.dropna().values.astype(float)
     q_vals = q_vals[np.isfinite(q_vals) & (q_vals > 0)]
     if len(q_vals) >= 4:
-        # IQR outlier removal — tighter (1.0×) to reject sudden jumps/drops
         q1, q3 = np.percentile(q_vals, [25, 75])
         iqr = q3 - q1
         if np.isfinite(iqr) and iqr > 0:
-            lo = q1 - 1.0 * iqr
-            hi = q3 + 1.0 * iqr
+            lo = q1 - 1.5 * iqr
+            hi = q3 + 1.5 * iqr
             q_trim = q_vals[(q_vals >= lo) & (q_vals <= hi)]
             if len(q_trim) >= 3:
                 q_vals = q_trim
-        # Consecutive-jump filter: drop any session whose implied_Q deviates
-        # more than 20% from the median of the already-cleaned set. This catches
-        # single-point spikes (e.g. BMS recalibration mid-session) that survive IQR.
-        if len(q_vals) >= 4:
-            med = float(np.median(q_vals))
-            if med > 0:
-                q_vals = q_vals[np.abs(q_vals - med) / med <= 0.20]
 
     q_init = float(np.nanmedian(q_vals)) if len(q_vals) > 0 else np.nan
     out['q_init_first_ah'] = q_init
@@ -2778,8 +2846,8 @@ def _detect_pack_change_sessions(g: pd.DataFrame) -> pd.DataFrame:
             if chg:
                 _q_pre  = float(roll_q_prev.iloc[_i]) if np.isfinite(roll_q_prev.iloc[_i]) else np.nan
                 _q_post = float(roll_q.iloc[_i])      if np.isfinite(roll_q.iloc[_i])      else np.nan
-                _s_old  = _q_pre  / (p * round(153.0/_D,1)) if np.isfinite(_q_pre)  else np.nan
-                _s_new  = _q_post / (p * round(153.0/_D,1)) if np.isfinite(_q_post) else np.nan
+                _s_old  = _q_pre  / (p * 153.0) if np.isfinite(_q_pre)  else np.nan
+                _s_new  = _q_post / (p * 153.0) if np.isfinite(_q_post) else np.nan
                 _n_est  = round(jfrac * p * _s_old / (_s_new - _s_old)) \
                           if (np.isfinite(_s_old) and np.isfinite(_s_new)
                               and (_s_new - _s_old) > 0.01) else '?'
@@ -3144,7 +3212,9 @@ def train_xgboost_soh(labeled: pd.DataFrame) -> dict:
         if len(X) < 8:
             # Keep per-vehicle output instead of dropping the vehicle.
             g['soh_xgb']    = g['soh_smooth'].values
-            g['soh_display'] = _apply_confirmation_gate(g['soh_smooth'].values)
+            g['soh_display'] = _apply_confirmation_gate(
+                g['soh_smooth'].values,
+                segments=g['pack_segment'].values if 'pack_segment' in g.columns else None)
             fi = pd.Series(0.0, index=feats if len(feats) > 0 else ['no_features'])
             results[vid] = {
                 'model': None, 'scaler': None, 'features': feats,
@@ -3200,7 +3270,9 @@ def train_xgboost_soh(labeled: pd.DataFrame) -> dict:
         # Raw prediction stored for debugging; soh_display is the customer-facing value
         raw_pred         = model.predict(scaler.transform(X.values))
         g['soh_xgb']     = raw_pred
-        g['soh_display']  = _apply_confirmation_gate(raw_pred)
+        _seg_for_gate    = g['pack_segment'].values if 'pack_segment' in g.columns else None
+        g['soh_display']  = _apply_confirmation_gate(raw_pred, segments=_seg_for_gate)
+        jump_events      = _classify_soh_jumps(raw_pred, segments=_seg_for_gate)
 
         mae = mean_absolute_error(y_te, model.predict(X_te_s))
         r2  = r2_score(y_te, model.predict(X_te_s)) if len(y_te) > 1 else np.nan
@@ -3209,9 +3281,14 @@ def train_xgboost_soh(labeled: pd.DataFrame) -> dict:
         results[vid] = {
             'model': model, 'scaler': scaler, 'features': feats,
             'sessions': g, 'mae': mae, 'r2': r2, 'feature_importance': fi,
+            'jump_events': jump_events,
         }
         n_fit += 1
         print(f"    {vid}: sessions={len(g)}, MAE={mae:.2f}%, R={r2:.3f}")
+        for _je in jump_events:
+            _tag = ' REVIEW' if _je.get('review') else ''
+            print(f"    [SOH jump] {vid}: +{_je['step_pp']:.1f}pp at session {_je['pos']} "
+                  f"({_je['pre']:.1f}->{_je['post']:.1f}%) => {_je['verdict']}{_tag}")
         print(f"    Top features: {', '.join(fi.head(3).index.tolist())}")
 
     if not results:
@@ -4758,6 +4835,9 @@ def plot_customer_views(xgb_results, lstm_results, rul_all, replacement_events, 
     print(f"  Customer vehicle cards -> {cards_dir}")
 
 
+# ------------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------------
 def _generate_html_report(xgb_results, rul_all, plot_path):
     """Generate a self-contained HTML fleet health report from pipeline results."""
     import json, datetime as _dt
