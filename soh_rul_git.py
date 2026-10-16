@@ -3707,6 +3707,167 @@ def _fit_ah_model_for_rul(g: pd.DataFrame, soh_col: str = 'soh_display',
     }
 
 
+RUL_CI_PCT              = 80      # P10-P90 is reported as an approximate 80% interval
+RUL_FULL_CONF_SPAN_DAYS = 730.0   # History length that earns full weight on the per-vehicle fade rate
+RUL_RATE_CLAMP_LO       = 0.5     # Final fade rate is kept within [LO, HI] x fleet median rate
+RUL_RATE_CLAMP_HI       = 3.0
+RUL_BOOT_N              = 300     # Bootstrap resamples for the observed fade-rate interval
+
+
+def _conf_label(pct):
+    if not np.isfinite(pct):
+        return 'n/a'
+    return 'High' if pct >= 70 else ('Medium' if pct >= 40 else 'Low')
+
+
+def _robust_fade_rate(g: pd.DataFrame, n_bins: int = 120, n_boot: int = RUL_BOOT_N) -> dict:
+    """Observed SOH fade rate (pp/year, positive = losing capacity) from the ungated SOH
+    series: Theil-Sen slope on time-binned medians, with a bootstrap 10/90 interval."""
+    out = {'rate': np.nan, 'lo': np.nan, 'hi': np.nan, 'span_days': np.nan, 'n': 0}
+    col = next((c for c in ('soh_xgb', 'soh_smooth') if c in g.columns), None)
+    if col is None or 'start_utc' not in g.columns:
+        return out
+    t = pd.to_numeric(g['start_utc'], errors='coerce').values.astype(float) / 86400.0
+    y = pd.to_numeric(g[col], errors='coerce').values.astype(float)
+    ok = np.isfinite(t) & np.isfinite(y)
+    if ok.sum() < 30:
+        return out
+    t, y = t[ok], y[ok]
+    span = float(t.max() - t.min())
+    out['span_days'], out['n'] = span, int(len(t))
+    if span < 30:
+        return out
+    edges = np.linspace(t.min(), t.max(), n_bins + 1)
+    idx = np.clip(np.digitize(t, edges[1:-1]), 0, n_bins - 1)
+    tb, yb = [], []
+    for b in range(n_bins):
+        m = idx == b
+        if m.any():
+            tb.append(float(np.median(t[m])))
+            yb.append(float(np.median(y[m])))
+    tb, yb = np.asarray(tb), np.asarray(yb)
+    if len(tb) < 10:
+        return out
+    from scipy.stats import theilslopes
+    out['rate'] = float(-theilslopes(yb, tb)[0] * 365.0)
+    rng = np.random.default_rng(0)
+    boots = []
+    for _ in range(int(n_boot)):
+        sel = rng.integers(0, len(tb), len(tb))
+        if np.ptp(tb[sel]) <= 0:
+            continue
+        boots.append(-theilslopes(yb[sel], tb[sel])[0] * 365.0)
+    if len(boots) >= 20:
+        out['lo'], out['hi'] = (float(v) for v in np.percentile(boots, [10, 90]))
+    return out
+
+
+def _fleet_fade_reference(obs_fade: dict) -> dict:
+    rates = [d['rate'] for d in obs_fade.values()
+             if np.isfinite(d.get('rate', np.nan)) and d['rate'] > 0.1 and d.get('span_days', 0) >= 180]
+    if not rates:
+        return {'rate': np.nan, 'lo': np.nan, 'hi': np.nan, 'n': 0}
+    med = float(np.median(rates))
+    if len(rates) >= 3:
+        lo, hi = (float(v) for v in np.percentile(rates, [25, 75]))
+    else:
+        lo, hi = 0.7 * med, 1.3 * med
+    return {'rate': med, 'lo': lo, 'hi': hi, 'n': len(rates)}
+
+
+def _reliable_rul_blend(soh_now, model_p50_days, obs, fleet, span_days, n_sessions, cap_days, eol=SOH_EOL):
+    """Combine the Ah-model RUL with the observed fade rate and the fleet rate.
+
+    The vehicle rate is the faster of (model-implied, observed). It is then shrunk
+    toward the fleet rate in proportion to how little history exists, clamped to a
+    plausible band, and turned into P10/P50/P90 whose order is guaranteed.
+    """
+    if not np.isfinite(soh_now) or soh_now <= eol:
+        return None
+    margin = float(soh_now - eol)
+    r_model = (margin / (model_p50_days / 365.0)
+               if np.isfinite(model_p50_days) and model_p50_days > 0 else np.nan)
+    r_obs, r_lo, r_hi = obs.get('rate', np.nan), obs.get('lo', np.nan), obs.get('hi', np.nan)
+    cands = [r for r in (r_obs, r_model) if np.isfinite(r) and r > 0]
+    r_fleet, f_lo, f_hi = fleet.get('rate', np.nan), fleet.get('lo', np.nan), fleet.get('hi', np.nan)
+    fleet_ok = np.isfinite(r_fleet)
+    r_veh = max(cands) if cands else r_fleet
+    if not np.isfinite(r_veh):
+        return None
+
+    w = min(1.0, float(span_days) / RUL_FULL_CONF_SPAN_DAYS) if np.isfinite(span_days) and fleet_ok else 1.0
+    r_final = w * r_veh + (1.0 - w) * r_fleet if fleet_ok else r_veh
+    if fleet_ok:
+        r_final = min(max(r_final, RUL_RATE_CLAMP_LO * r_fleet), RUL_RATE_CLAMP_HI * r_fleet)
+    r_final = max(r_final, float(RUL_FLOOR_PCT_PER_YEAR))
+
+    lo_v = r_lo if np.isfinite(r_lo) else 0.7 * r_veh
+    hi_v = max(r_hi if np.isfinite(r_hi) else 1.3 * r_veh, r_veh, r_model if np.isfinite(r_model) else 0.0)
+    lo_f = w * lo_v + (1.0 - w) * f_lo if fleet_ok else lo_v
+    hi_f = w * hi_v + (1.0 - w) * f_hi if fleet_ok else hi_v
+    lo_f = max(min(lo_f, 0.85 * r_final), float(RUL_FLOOR_PCT_PER_YEAR))   # never claim tighter than +/-15%
+    hi_f = max(hi_f, 1.15 * r_final)
+
+    p50 = margin / r_final * 365.0
+    p10 = margin / hi_f * 365.0
+    p90 = margin / lo_f * 365.0
+    width = (p90 - p10) / p50 if p50 > 0 else np.inf
+
+    span_s = min(1.0, float(span_days) / RUL_FULL_CONF_SPAN_DAYS) if np.isfinite(span_days) else 0.0
+    agree = (min(r_model, r_obs) / max(r_model, r_obs)
+             if np.isfinite(r_model) and np.isfinite(r_obs) and r_model > 0 and r_obs > 0 else 0.5)
+    tight = 1.0 / (1.0 + width) if np.isfinite(width) else 0.0
+    sess_s = min(1.0, float(n_sessions) / 300.0)
+    conf = 100.0 * (0.35 * span_s + 0.25 * agree + 0.25 * tight + 0.15 * sess_s)
+
+    flags = []
+    if np.isfinite(span_days) and span_days < 365:
+        flags.append('short_history')
+    if agree < 0.5:
+        flags.append('model_vs_observed_disagree')
+    if width > 1.5:
+        flags.append('wide_interval')
+    capped = bool(p50 >= cap_days)
+    if capped:
+        flags.append('beyond_report_horizon')
+    n_quality_flags = sum(f in ('model_vs_observed_disagree', 'wide_interval', 'short_history') for f in flags)
+    if n_quality_flags >= 2:
+        conf = min(conf, 59.0)
+    elif n_quality_flags == 1:
+        conf = min(conf, 69.0)
+
+    return {
+        'p10': min(p10, cap_days), 'p50': min(p50, cap_days), 'p90': min(p90, cap_days),
+        'rate_final': r_final, 'rate_model': r_model, 'rate_obs': r_obs, 'weight_vehicle': w,
+        'conf_pct': round(conf, 0), 'halfwidth_pct': round(50.0 * width, 0) if np.isfinite(width) else np.nan,
+        'flags': flags, 'capped': capped,
+    }
+
+
+def _rank_check_rul(rul_all: dict, ah_fits: dict):
+    """At similar daily Ah throughput a lower SOH must not have a much longer life."""
+    ids = [v for v, r in rul_all.items() if r.get('rul_method') == 'shrunk_blend']
+    for i in ids:
+        for j in ids:
+            if i == j:
+                continue
+            ri, rj = rul_all[i], rul_all[j]
+            ai = ah_fits.get(i, {}).get('rate_365d', np.nan)
+            aj = ah_fits.get(j, {}).get('rate_365d', np.nan)
+            if not (np.isfinite(ai) and np.isfinite(aj) and ai > 0 and aj > 0):
+                continue
+            if abs(ai - aj) / ((ai + aj) / 2.0) > 0.4:
+                continue
+            if (ri['soh_now'] < rj['soh_now'] - 1.0
+                    and ri['rul_days_p50'] > 1.5 * rj['rul_days_p50']
+                    and ri['rul_days_p50'] < REPORT_RUL_CAP_DAYS * 1.0001):
+                for rr in (ri, rj):
+                    if 'rank_inconsistent' not in rr['rul_flags']:
+                        rr['rul_flags'].append('rank_inconsistent')
+                        rr['rul_confidence_pct'] = max(0.0, rr['rul_confidence_pct'] - 15.0)
+                        rr['rul_confidence_label'] = _conf_label(rr['rul_confidence_pct'])
+
+
 def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None,
                     replacement_events: pd.DataFrame = None) -> dict:
     print("[6/6] Computing RUL...")
@@ -3724,6 +3885,14 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
     if np.isfinite(_fleet_alpha):
         print(f"  [Ah model] fleet alpha = {_fleet_alpha:.5f} %/sqrt(Ah) "
               f"from {len(_good_alphas)} vehicles")
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # ── Observed fade-rate pre-pass (ungated SOH) + fleet reference ───────────
+    _obs_fade = {_v: _robust_fade_rate(_r['sessions']) for _v, _r in xgb_results.items()}
+    _fleet_fade = _fleet_fade_reference(_obs_fade)
+    if np.isfinite(_fleet_fade['rate']):
+        print(f"  [RUL blend] fleet observed fade = {_fleet_fade['rate']:.2f} pp/yr "
+              f"(IQR {_fleet_fade['lo']:.2f}-{_fleet_fade['hi']:.2f}) from {_fleet_fade['n']} vehicles")
     # ──────────────────────────────────────────────────────────────────────────
 
     for vid, res in xgb_results.items():
@@ -4034,6 +4203,36 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                       f"RUL={_cap_d(_ah_p50):.0f}d (sqrt_t was {_sqrtt_p50:.0f}d)")
         # ───────────────────────────────────────────────────────────────────────
 
+        # ── Reliability layer: blend model, observed fade and fleet rate ───────
+        if rul.get('slope_basis') != 'monitoring_in_progress':
+            _rb = _reliable_rul_blend(
+                soh_now, rul.get('rul_days_p50', np.nan), _obs_fade.get(vid, {}),
+                _fleet_fade, _eff_days_span, _total_sessions, float(REPORT_RUL_CAP_DAYS))
+            if _rb is not None:
+                print(f"    [RUL blend] {vid}: model={rul.get('rul_days_p50', np.nan):.0f}d -> "
+                      f"{_rb['p50']:.0f}d (P10 {_rb['p10']:.0f} / P90 {_rb['p90']:.0f}) "
+                      f"rate model={_rb['rate_model']:.2f} obs={_rb['rate_obs']:.2f} "
+                      f"final={_rb['rate_final']:.2f} pp/yr, w={_rb['weight_vehicle']:.2f}, "
+                      f"confidence {_rb['conf_pct']:.0f}% ({_conf_label(_rb['conf_pct'])})"
+                      + (f" flags={','.join(_rb['flags'])}" if _rb['flags'] else ''))
+                rul['rul_days_p10'] = _rb['p10']
+                rul['rul_days_p50'] = _rb['p50']
+                rul['rul_days_p90'] = _rb['p90']
+                rul['rul_method'] = 'shrunk_blend'
+                rul['rul_confidence_pct'] = _rb['conf_pct']
+                rul['rul_confidence_label'] = _conf_label(_rb['conf_pct'])
+                rul['rul_ci_pct'] = RUL_CI_PCT
+                rul['rul_halfwidth_pct'] = _rb['halfwidth_pct']
+                rul['rul_capped'] = _rb['capped']
+                rul['rul_flags'] = list(_rb['flags'])
+                rul['fade_rate_pp_yr'] = _rb['rate_final']
+                if _conf_label(_rb['conf_pct']) == 'Low':
+                    rul['rul_status_note'] = (
+                        f"Low-confidence estimate ({_rb['conf_pct']:.0f}%): "
+                        + (', '.join(f.replace('_', ' ') for f in _rb['flags']) or 'limited data')
+                        + ". Treat the range, not the single number.")
+        # ───────────────────────────────────────────────────────────────────────
+
         init_cap_ah = q_base_ah if np.isfinite(q_base_ah) else np.nan
         current_cap_ah = (init_cap_ah * soh_now / 100.0) if np.isfinite(init_cap_ah) and np.isfinite(soh_now) else np.nan
         init_cap_kwh = (init_cap_ah * v_nom / 1000.0) if np.isfinite(init_cap_ah) and np.isfinite(v_nom) else np.nan
@@ -4151,6 +4350,10 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
                 f"likely={_fmt_eol_date(rul.get('eol_date_p50_ist', pd.NaT), rul.get('rul_days_p50', np.nan))} | "
                 f"best={_fmt_eol_date(rul.get('eol_date_p90_ist', pd.NaT), rul.get('rul_days_p90', np.nan))}"
             )
+            if np.isfinite(rul.get('rul_confidence_pct', np.nan)):
+                print(f"RUL confidence          : {rul['rul_confidence_pct']:.0f}% ({rul.get('rul_confidence_label', '')}) | "
+                      f"~{RUL_CI_PCT}% interval = P10-P90 (+/-{rul.get('rul_halfwidth_pct', np.nan):.0f}%)"
+                      + (f" | flags: {', '.join(rul.get('rul_flags', []))}" if rul.get('rul_flags') else ''))
             print(f"Distance covered        : {_fmt_km(rul.get('km_run_till_date', np.nan))}")
             _rel = _sb not in ('', 'already_at_eol') and 'floor_rate' not in _sb and 'insufficient' not in _sb
             if _rel:
@@ -4163,6 +4366,7 @@ def compute_all_rul(xgb_results, lstm_results, df_raw, prev_rul_all: dict = None
             else:
                 print("Distance remaining      : N/A (insufficient trend data)")
 
+    _rank_check_rul(rul_all, _ah_model_fits)
     return rul_all
 
 # ------------------------------------------------------------------------------
@@ -4925,13 +5129,19 @@ def _generate_html_report(xgb_results, rul_all, plot_path):
             'status_note': str(rr.get('rul_status_note', '') or ''),
             'last_seen': _fmtd(rr.get('last_seen_datetime_ist')) or '',
             'soh_history': soh_history,
+            'rul_conf_pct': _sf(rr.get('rul_confidence_pct'), 0),
+            'rul_conf_label': str(rr.get('rul_confidence_label', '') or ''),
+            'rul_ci_pct': _si(rr.get('rul_ci_pct')),
+            'rul_halfwidth_pct': _sf(rr.get('rul_halfwidth_pct'), 0),
+            'rul_capped': bool(rr.get('rul_capped', False)),
+            'rul_flags': [str(f).replace('_', ' ') for f in (rr.get('rul_flags') or [])],
         })
 
     data_json = json.dumps(vehicles, ensure_ascii=False)
     gen_at = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
 
     _HTML_JS = r"""
-const EOL_SOH = 70;
+const EOL_SOH = __EOL_SOH__;
 
 function fmtN(v, d) {
   if (v === null || v === undefined || isNaN(v)) return '—';
@@ -4941,6 +5151,14 @@ function fmtDays(d) {
   if (d === null || d === undefined) return '—';
   if (d >= 365) return (d / 365).toFixed(1) + ' yr';
   return Math.round(d) + ' d';
+}
+function fmtLife(v, d) {
+  if (d === null || d === undefined) return '—';
+  const s = fmtDays(d);
+  return (v.rul_capped && d >= (v.rul_p50 || 0)) ? '> ' + s : s;
+}
+function confClass(l) {
+  return {High: 'conf-high', Medium: 'conf-med', Low: 'conf-low'}[l] || 'conf-na';
 }
 function riskClass(r) {
   return {high: 'risk-high', watch: 'risk-watch', healthy: 'risk-ok', unknown: 'risk-unk'}[r] || 'risk-unk';
@@ -4954,7 +5172,7 @@ function drawChart(v) {
   const hist = v.soh_history || [];
   const dataSpan = v.data_span_days || (hist.length ? hist[hist.length-1][0] : 365);
   let xMax = dataSpan;
-  if (v.has_rul && v.rul_p90) xMax = dataSpan + v.rul_p90 * 1.15;
+  if (v.has_rul && v.rul_p90) xMax = dataSpan + Math.min(v.rul_p90, (v.rul_p50 || v.rul_p90) * 1.6) * 1.15;
   xMax = Math.max(xMax, dataSpan * 1.25, 180);
   const yMin = 64, yMax = 103;
   const X = t => pL + (t / xMax) * (W - pL - pR);
@@ -5027,14 +5245,19 @@ function renderCard(v) {
   const soh = v.soh_now !== null ? v.soh_now.toFixed(1) + '%' : '—';
   const kwh = v.current_kwh !== null ? v.current_kwh.toFixed(1) + ' kWh' : '—';
   const initKwh = v.init_kwh ? v.init_kwh.toFixed(1) : '?';
-  const rul = v.has_rul && v.rul_p50 ? fmtDays(v.rul_p50) : 'New vehicle';
+  const rul = v.has_rul && v.rul_p50 ? fmtLife(v, v.rul_p50) : 'New vehicle';
   const eol = v.eol_p50 || '—';
   const note = v.status_note || '';
   const chart = drawChart(v);
 
   const rul_range = (v.has_rul && v.rul_p10 && v.rul_p90)
-    ? `<span class="sub-note">${fmtDays(v.rul_p10)} – ${fmtDays(v.rul_p90)} range</span>`
+    ? `<span class="sub-note">${v.rul_ci_pct || 80}% interval: ${fmtDays(v.rul_p10)} – ${fmtLife(v, v.rul_p90)}`
+      + (v.rul_halfwidth_pct !== null && v.rul_halfwidth_pct !== undefined ? ` (±${Math.round(v.rul_halfwidth_pct)}%)` : '') + `</span>`
     : '';
+  const conf = (v.has_rul && v.rul_conf_pct !== null && v.rul_conf_pct !== undefined)
+    ? `<span class="conf-pill ${confClass(v.rul_conf_label)}">Confidence ${Math.round(v.rul_conf_pct)}% · ${v.rul_conf_label}</span>`
+    : '';
+  const flagTxt = (v.rul_flags && v.rul_flags.length) ? `<div class="status-note">Reliability notes: ${v.rul_flags.join(', ')}</div>` : '';
 
   return `<div class="vcard" id="card-${CSS.escape(v.id)}">
   <div class="vcard-head">
@@ -5055,6 +5278,7 @@ function renderCard(v) {
       <div class="eyebrow">Life remaining</div>
       <div class="stat-big">${rul}</div>
       <div class="stat-note">${v.has_rul ? ('EOL ~' + eol) : 'Collecting baseline data'} ${rul_range}</div>
+      <div class="stat-note">${conf}</div>
     </div>
     <div class="stat-box">
       <div class="eyebrow">Equiv. full cycles</div>
@@ -5068,6 +5292,7 @@ function renderCard(v) {
     </div>
   </div>
   ${note ? `<div class="status-note">${note}</div>` : ''}
+  ${flagTxt}
   <div class="vcard-foot">Last seen ${v.last_seen || '—'}</div>
 </div>`;
 }
@@ -5075,13 +5300,16 @@ function renderCard(v) {
 function renderTable(vehicles) {
   const rows = vehicles.map(v => {
     const soh = v.soh_now !== null ? v.soh_now.toFixed(1) + '%' : '—';
-    const rul = v.has_rul && v.rul_p50 ? fmtDays(v.rul_p50) : '—';
+    const rul = v.has_rul && v.rul_p50 ? fmtLife(v, v.rul_p50) : '—';
     const eol = v.eol_p50 || '—';
+    const confCell = (v.has_rul && v.rul_conf_pct !== null && v.rul_conf_pct !== undefined)
+      ? `<span class="conf-pill ${confClass(v.rul_conf_label)}">${Math.round(v.rul_conf_pct)}% ${v.rul_conf_label}</span>` : '—';
     return `<tr onclick="scrollToCard('${v.id}')" style="cursor:pointer">
       <td class="td-id">${v.id}</td>
       <td class="td-soh ${riskClass(v.risk)}">${soh}</td>
       <td>${v.current_kwh !== null ? v.current_kwh.toFixed(1) + ' kWh' : '—'}</td>
       <td>${rul}</td>
+      <td>${confCell}</td>
       <td>${eol}</td>
       <td>${fmtN(v.cycles)}</td>
       <td>${fmtN(v.sessions)}</td>
@@ -5092,7 +5320,7 @@ function renderTable(vehicles) {
   <table class="fleet-table">
     <thead><tr>
       <th>Vehicle</th><th>SOH</th><th>Capacity</th>
-      <th>Life left</th><th>Est. EOL</th>
+      <th>Life left</th><th>Confidence</th><th>Est. EOL</th>
       <th>Cycles</th><th>Sessions</th><th>Status</th>
     </tr></thead>
     <tbody>${rows}</tbody>
@@ -5198,6 +5426,12 @@ h1{font-size:22px;font-weight:800;letter-spacing:-.02em;margin-top:4px}
 .vcard-foot{font-size:11px;color:#A0AEC0;margin-top:12px}
 .ax{font-family:ui-monospace,monospace;font-size:9.5px;fill:#63768F}
 .eol-lbl{fill:#C2410C;font-size:8.5px}
+.conf-pill{display:inline-flex;align-items:center;font-size:11px;font-weight:600;
+  padding:2px 9px;border-radius:999px;margin-top:4px}
+.conf-high{background:#d1fae5;color:#065f46}
+.conf-med{background:#fef3c7;color:#92400e}
+.conf-low{background:#fee2e2;color:#991b1b}
+.conf-na{background:#f3f4f6;color:#374151}
 @media(max-width:600px){
   .cards-grid{grid-template-columns:1fr}
   .stats-grid{grid-template-columns:1fr}
@@ -5214,7 +5448,7 @@ h1{font-size:22px;font-weight:800;letter-spacing:-.02em;margin-top:4px}
         '</head>\n<body>\n<div id="root"></div>\n<script>\n'
         f'const VEHICLES = {data_json};\n'
         f'const GENERATED_AT = {json.dumps(gen_at)};\n'
-        f'{_HTML_JS}\n'
+        f'{_HTML_JS.replace("__EOL_SOH__", str(int(SOH_EOL)))}\n'
         '</script>\n</body>\n</html>\n'
     )
 
